@@ -1,0 +1,19 @@
+[package]
+name = "talon-rust-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Native async Rust client for the Talon distributed object-store cache"
+publish = false
+
+[dependencies]
+talon-core.workspace = true
+talon-cache-client.workspace = true
+talon-transport.workspace = true
+futures.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

@@ -11,6 +11,7 @@ members = [
     "crates/talon-backend",
     "crates/talon-client",
     "clients/c",
+    "clients/rust",
     "clients/python",
     "crates/talon-observability",
     "crates/talon-metadata",
@@ -26,6 +27,7 @@ rust-version = "1.80"
 [workspace.dependencies]
 talon-core = { path = "crates/talon-core" }
 talon-cache-client = { path = "crates/talon-cache-client" }
+talon-rust-client = { path = "clients/rust" }
 talon-transport = { path = "crates/talon-transport" }
 talon-metadata = { path = "crates/talon-metadata" }
 

@@ -112,8 +112,12 @@ def test_stat_returns_size_and_version(client):
     assert info.size > 0
 
 
-def test_read_returns_exact_bytes(client):
+def test_read_with_only_version_preserves_supplied_version(client):
     assert client.read(URI, version=VERSION, offset=0, length=4096) == ramp(0, 4096)
+
+
+def test_read_with_only_size_preserves_supplied_size(client):
+    assert client.read(URI, size=1024, offset=0, length=4096) == ramp(0, 1024)
 
 
 def test_read_at_offset(client):
