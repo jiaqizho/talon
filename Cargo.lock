@@ -2583,8 +2583,8 @@ name = "talon-c"
 version = "0.1.0"
 dependencies = [
  "cc",
- "talon-cache-client",
  "talon-core",
+ "talon-rust-client",
  "talon-transport",
  "tokio",
 ]
@@ -2745,9 +2745,19 @@ name = "talon-python"
 version = "0.1.0"
 dependencies = [
  "pyo3",
+ "talon-rust-client",
+ "tokio",
+]
+
+[[package]]
+name = "talon-rust-client"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "talon-cache-client",
  "talon-core",
- "talon-fuse",
  "talon-transport",
+ "thiserror 2.0.19",
  "tokio",
 ]
 

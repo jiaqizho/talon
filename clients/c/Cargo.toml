@@ -14,7 +14,7 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
 talon-core.workspace = true
-talon-cache-client.workspace = true
+talon-rust-client.workspace = true
 talon-transport.workspace = true
 tokio.workspace = true
 

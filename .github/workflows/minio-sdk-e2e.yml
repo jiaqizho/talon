@@ -17,6 +17,7 @@ on:
       - "deploy/docker/**"
       - "deploy/helm/talon/**"
       - "clients/python/**"
+      - "clients/rust/**"
       - "clients/java/**"
       - "clients/c/**"
       - "crates/talon-client/**"
