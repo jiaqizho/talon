@@ -40,6 +40,7 @@ use talon_transport::control_tls::ControlTlsChannel;
 use talon_transport::{codec, ControlMessage};
 use talon_worker::mapping_guard::MappingGuard;
 use talon_worker::tokio_conn::{handle_conn, read_control};
+#[cfg(target_os = "linux")]
 use talon_worker::uring_conn;
 use talon_worker::{
     serve_admin, BlockIndex, InFlightLoads, PagedBlockStore, TenantRateLimiter, WholeBlockStore,
@@ -59,6 +60,7 @@ const MAX_DATA_PLANE_CONNECTIONS: usize = 1024;
 /// Blocking helper threads per io_uring ring, for the zero-copy `sendfile`
 /// path. Kept small because every ring has its own pool and the rings are
 /// pinned: a large pool per ring would oversubscribe the cores they sit on.
+#[cfg(target_os = "linux")]
 const URING_BLOCKING_THREADS_PER_RING: usize = 4;
 
 /// Bridges the backend retry decorator to the worker's metrics registry.
@@ -658,7 +660,10 @@ async fn main() -> anyhow::Result<()> {
     let force_tokio = std::env::var(FORCE_TOKIO_ENV)
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
+    #[cfg(target_os = "linux")]
     let uring_available = talon_worker::uring_serve::io_uring_available();
+    #[cfg(not(target_os = "linux"))]
+    let uring_available = false;
     if force_tokio {
         tracing::info!("{FORCE_TOKIO_ENV} is set; serving the data plane on the Tokio path");
     } else if !uring_available {
@@ -667,6 +672,7 @@ async fn main() -> anyhow::Result<()> {
              data plane. Performance will be lower under high connection counts."
         );
     }
+    #[cfg(target_os = "linux")]
     if !force_tokio && uring_available {
         let rings = talon_worker::uring_serve::resolve_ring_count(cfg.data_plane_rings);
         tracing::info!(

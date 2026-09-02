@@ -20,10 +20,13 @@ pub mod paged_store;
 pub mod rate_limit;
 pub mod runtime;
 pub mod sendfile;
+#[cfg(target_os = "linux")]
 pub mod splice;
 pub mod staging;
 pub mod tokio_conn;
+#[cfg(target_os = "linux")]
 pub mod uring_conn;
+#[cfg(target_os = "linux")]
 pub mod uring_serve;
 pub mod wal;
 pub mod wal_checkpoint;
@@ -45,6 +48,7 @@ pub use runtime::{ServeOutcome, WorkerRuntime};
 pub use sendfile::{
     send_file_range, send_header_and_file_range, send_header_and_file_ranges, DEFAULT_CHUNK,
 };
+#[cfg(target_os = "linux")]
 pub use splice::{ingest_put, splice_to_file};
 pub use staging::{Checksum, Stager};
 pub use write_cache::{FlushItem, WriteCache};
