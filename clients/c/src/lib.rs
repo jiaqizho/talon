@@ -13,12 +13,12 @@ use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use talon_cache_client::{plan_read, BlockReader, CoordinatorClient, PlacementCache};
-use talon_core::{ObjectId, Version};
+use talon_rust_client::{
+    parse_uri as parse_rust_uri, Client as RustClient, Error as RustError, ObjectId,
+    ObjectStat as RustObjectStat, UriError,
+};
 
 const DEFAULT_BLOCK_SIZE: u32 = 256 << 20;
-const PLACEMENT_TTL_MS: u64 = 30_000;
-const REPLICAS_K: u8 = 1;
 
 const STATUS_OK: c_int = 0;
 const STATUS_INVALID_ARGUMENT: c_int = 1;
@@ -67,9 +67,7 @@ pub struct TalonClient {
 
 struct ClientInner {
     runtime: Arc<tokio::runtime::Runtime>,
-    coordinator: CoordinatorClient,
-    reader: BlockReader,
-    block_size: u32,
+    client: Arc<RustClient>,
     dispatcher: Arc<CallbackDispatcher>,
     next_request_id: AtomicU64,
 }
@@ -224,15 +222,12 @@ pub unsafe extern "C" fn talon_client_new(
             .enable_all()
             .build()
             .map_err(|error| (STATUS_RUNTIME_ERROR, error.to_string()))?;
-        let coordinator = CoordinatorClient::new(coordinator_addr);
-        let cache = Arc::new(PlacementCache::new(PLACEMENT_TTL_MS));
-        let reader = BlockReader::new(coordinator.clone(), cache, REPLICAS_K);
+        let rust_client = RustClient::new(coordinator_addr, block_size)
+            .map_err(|error| (STATUS_INVALID_ARGUMENT, error.to_string()))?;
         let client = Box::new(TalonClient {
             inner: Arc::new(ClientInner {
                 runtime: Arc::new(runtime),
-                coordinator,
-                reader,
-                block_size,
+                client: Arc::new(rust_client),
                 dispatcher: Arc::new(dispatcher),
                 next_request_id: AtomicU64::new(1),
             }),
@@ -332,35 +327,22 @@ pub unsafe extern "C" fn talon_read_async(
         };
         let user_data = UserData(user_data);
         let runtime = Arc::clone(&inner.runtime);
-        let coordinator = inner.coordinator.clone();
-        let reader = inner.reader.clone();
+        let client = Arc::clone(&inner.client);
         let dispatcher = Arc::clone(&inner.dispatcher);
-        let block_size = inner.block_size;
+        let known_stat = match (known_version, known_size) {
+            (Some(version), Some(size)) => Some(RustObjectStat { size, version }),
+            _ => None,
+        };
         runtime.spawn(async move {
             let result = async {
                 if read_buffer.len == 0 {
                     return Ok(0);
                 }
-                let (version, size) = match (known_version, known_size) {
-                    (Some(version), Some(size)) => (Version::new(version.as_str()), size),
-                    _ => {
-                        let stat = coordinator
-                            .stat_object(&object)
-                            .await
-                            .map_err(|error| error.to_string())?;
-                        (Version::new(stat.version.as_str()), stat.size)
-                    }
-                };
                 let dst = unsafe { read_buffer.into_mut_slice() };
-                let plan = plan_read(
-                    &object,
-                    offset,
-                    dst.len() as u64,
-                    block_size,
-                    &version,
-                    size,
-                );
-                fetch_blocks_concurrent(reader, plan, dst, now_ms()).await
+                client
+                    .read_into(&object, offset, dst, known_stat.as_ref())
+                    .await
+                    .map_err(|error| error.to_string())
             }
             .await;
             dispatch_result(
@@ -372,60 +354,6 @@ pub unsafe extern "C" fn talon_read_async(
         });
         Ok(())
     })
-}
-
-/// Fetch every segment of `plan` concurrently into `dst`, rather than walking
-/// the blocks in series.
-///
-/// [`plan_read`] partitions the requested range into disjoint per-block segments
-/// (already clamped at EOF); each segment is handed an exclusive sub-slice of
-/// `dst`, and every block is fetched in parallel on the runtime. The segments
-/// cover `[0, planned_len)` in order and every task is joined before this future
-/// resolves; the caller owns `dst` until the callback runs (the header
-/// contract), so lending each task a disjoint `'static` sub-slice is sound.
-async fn fetch_blocks_concurrent(
-    reader: BlockReader,
-    plan: Vec<talon_cache_client::BlockSegment>,
-    dst: &'static mut [u8],
-    now_ms: u64,
-) -> Result<usize, String> {
-    if plan.is_empty() {
-        return Ok(0);
-    }
-
-    let mut tasks = tokio::task::JoinSet::new();
-    let mut rest = dst;
-    for segment in plan {
-        let want = segment.len as usize;
-        let (chunk, tail) = split_static_prefix(rest, want);
-        rest = tail;
-        let reader = reader.clone();
-        tasks.spawn(async move {
-            reader
-                .read_block_into(&segment.block, segment.offset_in_block, chunk, now_ms)
-                .await
-                .map_err(|error| error.to_string())
-                .map(|read| (read, want))
-        });
-    }
-
-    let mut written = 0usize;
-    while let Some(joined) = tasks.join_next().await {
-        let (read, want) = joined.map_err(|error| format!("block read task failed: {error}"))??;
-        if read != want {
-            return Err(format!(
-                "worker returned {read} of {want} requested bytes; the object may have changed"
-            ));
-        }
-        written += read;
-    }
-    Ok(written)
-}
-
-/// Split a `'static` buffer into an owned `'static` prefix of `n` bytes and the
-/// `'static` remainder, so each concurrent block fetch can own its slice.
-fn split_static_prefix(buf: &'static mut [u8], n: usize) -> (&'static mut [u8], &'static mut [u8]) {
-    buf.split_at_mut(n)
 }
 
 /// Submit an async stat.
@@ -458,11 +386,11 @@ pub unsafe extern "C" fn talon_stat_async(
 
         let user_data = UserData(user_data);
         let runtime = Arc::clone(&inner.runtime);
-        let coordinator = inner.coordinator.clone();
+        let client = Arc::clone(&inner.client);
         let dispatcher = Arc::clone(&inner.dispatcher);
         runtime.spawn(async move {
-            let result = coordinator
-                .stat_object(&object)
+            let result = client
+                .stat(&object)
                 .await
                 .map_err(|error| error.to_string());
             dispatch_result(
@@ -573,10 +501,7 @@ impl TalonResult {
         }
     }
 
-    fn stat(
-        request_id: u64,
-        result: Result<talon_cache_client::coordinator_client::ObjectStat, String>,
-    ) -> Self {
+    fn stat(request_id: u64, result: Result<RustObjectStat, String>) -> Self {
         match result {
             Ok(stat) => Self {
                 operation: OPERATION_STAT,
@@ -642,44 +567,18 @@ fn c_string(ptr: *const c_char, name: &str) -> Result<String, (c_int, String)> {
 }
 
 fn parse_uri(uri: &str) -> Result<ObjectId, (c_int, String)> {
-    let (scheme, rest) = uri.split_once("://").ok_or_else(|| {
-        (
-            STATUS_INVALID_ARGUMENT,
-            format!("expected a scheme://bucket/key URI, got {uri:?} (schemes: s3, gcs, az)"),
-        )
-    })?;
-    let backend = scheme.parse().map_err(|_| {
-        (
-            STATUS_INVALID_ARGUMENT,
-            format!("unknown backend scheme {scheme:?}"),
-        )
-    })?;
-    let (bucket, key) = rest.split_once('/').ok_or_else(|| {
-        (
-            STATUS_INVALID_ARGUMENT,
-            format!("URI is missing an object key: {uri:?}"),
-        )
-    })?;
-    if bucket.is_empty() {
-        return Err((
-            STATUS_INVALID_ARGUMENT,
-            format!("URI has an empty bucket: {uri:?}"),
-        ));
-    }
-    if key.is_empty() {
-        return Err((
-            STATUS_INVALID_ARGUMENT,
-            format!("URI has an empty object key: {uri:?}"),
-        ));
-    }
-    Ok(ObjectId::new(backend, bucket, key))
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    parse_rust_uri(uri).map_err(|error| {
+        let message = match error {
+            RustError::InvalidUri(UriError::UnknownScheme { scheme }) => {
+                format!("unknown backend scheme {scheme:?}")
+            }
+            RustError::InvalidUri(UriError::MissingKey { uri, .. }) => {
+                format!("URI is missing an object key: {uri:?}")
+            }
+            error => error.to_string(),
+        };
+        (STATUS_INVALID_ARGUMENT, message)
+    })
 }
 
 fn ffi_status<F>(f: F) -> c_int
@@ -1345,6 +1244,45 @@ mod tests {
         let snapshot = state.wait();
         assert_eq!(snapshot.status, STATUS_OK);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        unsafe {
+            talon_client_free(client);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn invalid_uri_messages_preserve_the_c_contract() {
+        let (client, _) = new_client().await;
+        for (uri, expected) in [
+            ("ftp://bucket/key", "unknown backend scheme \"ftp\""),
+            (
+                "az://bucket",
+                "URI is missing an object key: \"az://bucket\"",
+            ),
+        ] {
+            let uri = cstring(uri);
+            let mut request_id = 0;
+            let status = unsafe {
+                talon_read_async(
+                    client,
+                    uri.as_ptr(),
+                    0,
+                    ptr::null_mut(),
+                    0,
+                    ptr::null(),
+                    ptr::null(),
+                    Some(capture_callback),
+                    ptr::null_mut(),
+                    &mut request_id,
+                )
+            };
+
+            assert_eq!(status, STATUS_INVALID_ARGUMENT);
+            let message = unsafe { CStr::from_ptr(talon_last_error()) }
+                .to_string_lossy()
+                .into_owned();
+            assert_eq!(message, expected);
+        }
 
         unsafe {
             talon_client_free(client);

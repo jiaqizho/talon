@@ -19,12 +19,7 @@ crate-type = ["cdylib", "rlib"]
 extension-module = ["pyo3/extension-module"]
 
 [dependencies]
-talon-core.workspace = true
-talon-transport.workspace = true
-# The read path (block splitting, placement cache, replica fallback, pooling)
-# already exists here and is exercised by the FUSE client. Default features
-# exclude `fuser`, so no FUSE dependency reaches the Python extension.
-talon-fuse = { path = "../../crates/talon-fuse" }
+talon-rust-client.workspace = true
 # `extension-module` tells pyo3 not to link libpython, which is correct for a
 # wheel but breaks `cargo test` (the test harness needs a Python to link
 # against). It is therefore opt-in via the `extension-module` feature, which

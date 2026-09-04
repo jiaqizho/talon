@@ -1,12 +1,7 @@
 //! Python bindings for the Talon client (#312).
 //!
-//! Binds the Rust read path rather than reimplementing it. Block splitting,
-//! placement caching, replica fallback, and connection pooling already exist in
-//! `talon-fuse` and are exercised by the FUSE client; duplicating them in
-//! Python would duplicate their bugs too.
-//!
-//! `talon-fuse`'s default features exclude `fuser`, so no FUSE or libfuse
-//! dependency reaches the extension module.
+//! Adapts the native Rust client rather than reimplementing URI parsing, stat
+//! fallback, range planning, placement, or block reads in the binding.
 //!
 //! # Threading
 //!
@@ -26,55 +21,33 @@ use std::sync::Arc;
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-use talon_core::{ObjectId, Version};
-use talon_fuse::block_reader::FileView;
-use talon_fuse::{BlockReader, CoordinatorClient, PlacementCache};
+use talon_rust_client::{
+    parse_uri, Client as RustClient, Error as RustError, ObjectStat as RustObjectStat,
+};
 
-/// Placement entries older than this are re-resolved. Matches the FUSE client's
-/// default so both see the same staleness window.
-const PLACEMENT_TTL_MS: u64 = 30_000;
-/// Replicas to request per placement lookup. RF=1 in v1.
-const REPLICAS_K: u8 = 1;
-
-/// Milliseconds since the epoch, for placement-cache expiry.
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-/// Map a client-side failure to a Python exception, preserving the worker's own
-/// message. Flattening these to a generic error would hide the distinction
-/// between "object does not exist" and "every replica is down".
+/// Runtime construction failures are infrastructure errors.
 fn io_err<E: std::fmt::Display>(e: E) -> PyErr {
     PyIOError::new_err(e.to_string())
 }
 
-/// Parse a `scheme://bucket/key` URI into an [`ObjectId`].
-///
-/// The schemes match the namespaces the FUSE mount exposes (`s3`, `gcs`, `az`),
-/// so a path used with one client addresses the same object in the other.
-///
-/// Returns a plain `String` error rather than a `PyErr` so the parsing rules can
-/// be tested without an initialised interpreter; [`parse_uri`] wraps it.
-fn parse_uri_inner(uri: &str) -> Result<ObjectId, String> {
-    let (scheme, rest) = uri.split_once("://").ok_or_else(|| {
-        format!("expected a scheme://bucket/key URI, got {uri:?} (schemes: s3, gcs, az)")
-    })?;
-    let backend = scheme
-        .parse()
-        .map_err(|_| format!("unknown backend scheme {scheme:?}; expected s3, gcs, or az"))?;
-    let (bucket, key) = rest.split_once('/').ok_or_else(|| {
-        format!("URI is missing an object key: {uri:?} (expected {scheme}://bucket/key)")
-    })?;
-    if bucket.is_empty() {
-        return Err(format!("URI has an empty bucket: {uri:?}"));
+/// Preserve the SDK's input-versus-I/O error distinction at the Python boundary.
+fn client_err(error: RustError) -> PyErr {
+    let message = error.to_string();
+    match error {
+        RustError::InvalidUri(_) | RustError::InvalidArgument(_) => PyValueError::new_err(message),
+        RustError::Coordinator(_) | RustError::Block(_) => PyIOError::new_err(message),
     }
-    if key.is_empty() {
-        return Err(format!("URI has an empty object key: {uri:?}"));
+}
+
+fn complete_known_stat(
+    known_version: Option<String>,
+    known_size: Option<u64>,
+    resolved: RustObjectStat,
+) -> RustObjectStat {
+    RustObjectStat {
+        size: known_size.unwrap_or(resolved.size),
+        version: known_version.unwrap_or(resolved.version),
     }
-    Ok(ObjectId::new(backend, bucket, key))
 }
 
 /// An object's size and source version.
@@ -119,9 +92,7 @@ impl ObjectEntry {
 #[pyclass(module = "talon")]
 pub struct Client {
     runtime: Arc<tokio::runtime::Runtime>,
-    coordinator: CoordinatorClient,
-    reader: BlockReader,
-    block_size: u32,
+    client: Arc<RustClient>,
 }
 
 #[pymethods]
@@ -141,14 +112,11 @@ impl Client {
             .enable_all()
             .build()
             .map_err(io_err)?;
-        let coordinator_client = CoordinatorClient::new(coordinator);
-        let cache = Arc::new(PlacementCache::new(PLACEMENT_TTL_MS));
-        let reader = BlockReader::new(coordinator_client.clone(), cache, REPLICAS_K);
+        let client = RustClient::new(coordinator, block_size)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
         Ok(Self {
             runtime: Arc::new(runtime),
-            coordinator: coordinator_client,
-            reader,
-            block_size,
+            client: Arc::new(client),
         })
     }
 
@@ -175,66 +143,43 @@ impl Client {
         version: Option<&str>,
         size: Option<u64>,
     ) -> PyResult<Bound<'py, PyBytes>> {
-        let object = parse_uri_inner(uri).map_err(PyValueError::new_err)?;
-        let known_version = version.map(Version::new);
+        let object = parse_uri(uri).map_err(|error| PyValueError::new_err(error.to_string()))?;
+        let known_version = version.map(str::to_owned);
         let runtime = Arc::clone(&self.runtime);
-        let reader = self.reader.clone();
-        let coordinator = self.coordinator.clone();
-        let block_size = self.block_size;
+        let client = Arc::clone(&self.client);
 
         // Release the GIL: this is network I/O, and holding it would serialise
         // every reader thread in the process on one request.
         let bytes = py.allow_threads(move || {
             runtime.block_on(async move {
-                // One stat covers both, so only issue it when something is
-                // actually missing.
-                let (version, file_size) = match (known_version, size) {
-                    (Some(v), Some(s)) => (v, s),
-                    (known, known_size) => {
-                        let stat = coordinator
-                            .stat_object(&object)
-                            .await
-                            .map_err(|e| e.to_string())?;
-                        (
-                            known.unwrap_or_else(|| Version::new(stat.version.as_str())),
-                            known_size.unwrap_or(stat.size),
-                        )
+                let known_stat = match (known_version, size) {
+                    (Some(version), Some(size)) => Some(RustObjectStat { size, version }),
+                    (None, None) => None,
+                    (known_version, known_size) => {
+                        let stat = client.stat(&object).await?;
+                        Some(complete_known_stat(known_version, known_size, stat))
                     }
                 };
-                let len = length.unwrap_or_else(|| file_size.saturating_sub(offset));
-                let file = FileView {
-                    object: &object,
-                    block_size,
-                    version: &version,
-                    size: file_size,
-                };
-                reader
-                    .read(&file, offset, len, now_ms())
+                client
+                    .read(&object, offset, length, known_stat.as_ref())
                     .await
-                    .map_err(|e| e.to_string())
             })
         });
-        let bytes = bytes.map_err(PyIOError::new_err)?;
+        let bytes = bytes.map_err(client_err)?;
         Ok(PyBytes::new_bound(py, &bytes))
     }
 
     /// Return an object's size and version.
     fn stat(&self, py: Python<'_>, uri: &str) -> PyResult<ObjectStat> {
-        let object = parse_uri_inner(uri).map_err(PyValueError::new_err)?;
+        let object = parse_uri(uri).map_err(|error| PyValueError::new_err(error.to_string()))?;
         let runtime = Arc::clone(&self.runtime);
-        let coordinator = self.coordinator.clone();
-        let stat = py.allow_threads(move || {
-            runtime.block_on(async move {
-                coordinator
-                    .stat_object(&object)
-                    .await
-                    .map_err(|e| e.to_string())
-            })
-        });
-        let stat = stat.map_err(PyIOError::new_err)?;
+        let client = Arc::clone(&self.client);
+        let stat =
+            py.allow_threads(move || runtime.block_on(async move { client.stat(&object).await }));
+        let stat = stat.map_err(client_err)?;
         Ok(ObjectStat {
             size: stat.size,
-            version: stat.version.as_str().to_string(),
+            version: stat.version,
         })
     }
 
@@ -250,17 +195,11 @@ impl Client {
     /// instead of returning an incomplete list; use a narrower prefix.
     fn list(&self, py: Python<'_>, prefix: &str) -> PyResult<Vec<ObjectEntry>> {
         let runtime = Arc::clone(&self.runtime);
-        let coordinator = self.coordinator.clone();
+        let client = Arc::clone(&self.client);
         let prefix = prefix.to_string();
-        let entries = py.allow_threads(move || {
-            runtime.block_on(async move {
-                coordinator
-                    .list_objects(&prefix)
-                    .await
-                    .map_err(|e| e.to_string())
-            })
-        });
-        let entries = entries.map_err(PyIOError::new_err)?;
+        let entries =
+            py.allow_threads(move || runtime.block_on(async move { client.list(&prefix).await }));
+        let entries = entries.map_err(client_err)?;
         Ok(entries
             .into_iter()
             .map(|e| ObjectEntry {
@@ -273,14 +212,14 @@ impl Client {
     /// The coordinator address this client is connected to.
     #[getter]
     fn coordinator(&self) -> &str {
-        self.reader.coordinator_addr()
+        self.client.coordinator_addr()
     }
 
     fn __repr__(&self) -> String {
         format!(
             "Client(coordinator={:?}, block_size={})",
-            self.reader.coordinator_addr(),
-            self.block_size
+            self.client.coordinator_addr(),
+            self.client.block_size()
         )
     }
 
@@ -314,44 +253,57 @@ fn talon(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use talon_core::Backend;
 
     #[test]
-    fn parse_uri_accepts_each_backend_scheme() {
-        for (uri, backend) in [
-            ("s3://bucket/key", Backend::S3),
-            ("gcs://bucket/key", Backend::Gcs),
-            ("az://container/key", Backend::Azure),
-        ] {
-            let id = parse_uri_inner(uri).expect("valid uri");
-            assert_eq!(id.backend, backend);
-            assert_eq!(id.object_path, "key");
-        }
+    fn completing_partial_stat_preserves_caller_version() {
+        let completed = complete_known_stat(
+            Some("caller-version".into()),
+            None,
+            RustObjectStat {
+                size: 4096,
+                version: "coordinator-version".into(),
+            },
+        );
+
+        assert_eq!(completed.size, 4096);
+        assert_eq!(completed.version, "caller-version");
     }
 
     #[test]
-    fn parse_uri_keeps_nested_keys_intact() {
-        let id = parse_uri_inner("az://container/a/b/c.parquet").expect("valid uri");
-        assert_eq!(id.bucket, "container");
-        assert_eq!(id.object_path, "a/b/c.parquet");
+    fn invalid_read_argument_raises_value_error() {
+        pyo3::prepare_freethreaded_python();
+        let client = Client::new("unused", 1).unwrap();
+        let oversized = (isize::MAX as u64).saturating_add(1);
+
+        Python::with_gil(|py| {
+            let error = match client.read(
+                py,
+                "s3://bucket/key",
+                0,
+                Some(oversized),
+                Some("version"),
+                Some(oversized),
+            ) {
+                Ok(_) => panic!("oversized read must fail"),
+                Err(error) => error,
+            };
+
+            assert!(error.is_instance_of::<PyValueError>(py));
+        });
     }
 
-    /// Malformed URIs must name what is wrong; a bare "invalid input" sends the
-    /// caller to the debugger for something the message could have answered.
     #[test]
-    fn parse_uri_rejects_malformed_input_with_a_useful_message() {
-        for (uri, expected) in [
-            ("bucket/key", "scheme://bucket/key"),
-            ("ftp://bucket/key", "unknown backend scheme"),
-            ("az://bucket", "missing an object key"),
-            ("az:///key", "empty bucket"),
-            ("az://bucket/", "empty object key"),
-        ] {
-            let msg = parse_uri_inner(uri).expect_err("should reject");
-            assert!(
-                msg.contains(expected),
-                "error for {uri:?} should mention {expected:?}, got {msg:?}"
-            );
-        }
+    fn coordinator_failure_raises_io_error() {
+        pyo3::prepare_freethreaded_python();
+        let client = Client::new("127.0.0.1:0", 1).unwrap();
+
+        Python::with_gil(|py| {
+            let error = match client.stat(py, "s3://bucket/key") {
+                Ok(_) => panic!("stat without a coordinator must fail"),
+                Err(error) => error,
+            };
+
+            assert!(error.is_instance_of::<PyIOError>(py));
+        });
     }
 }
