@@ -9,7 +9,7 @@
 //! - handles short writes (a partial `sendfile` return advances the offset and
 //!   retries) and `EINTR`.
 //!
-//! `sendfile` is Linux-specific and blocking; per DESIGN.md it runs in the
+//! `sendfile` is platform-specific and blocking; per DESIGN.md it runs in the
 //! worker's blocking helper pool, never on the io_uring control ring. The
 //! caller writes the response frame header first, then calls
 //! [`send_file_range`] to stream the payload.
@@ -26,6 +26,7 @@ pub const DEFAULT_CHUNK: usize = 1 << 20;
 /// Returns the total number of bytes sent (== `len` on success). Handles short
 /// writes and `EINTR`; any other error is returned. `chunk` bounds a single
 /// syscall's transfer (use [`DEFAULT_CHUNK`]).
+#[cfg(target_os = "linux")]
 pub fn send_file_range(
     sock: &impl AsRawFd,
     file: &impl AsRawFd,
@@ -64,6 +65,61 @@ pub fn send_file_range(
     Ok(sent_total)
 }
 
+/// macOS `sendfile(2)` takes the input file first and reports bytes written
+/// through an in/out length pointer, including bytes written before an error.
+#[cfg(target_os = "macos")]
+pub fn send_file_range(
+    sock: &impl AsRawFd,
+    file: &impl AsRawFd,
+    offset: u64,
+    len: u64,
+    chunk: usize,
+) -> io::Result<u64> {
+    let out_fd: RawFd = sock.as_raw_fd();
+    let in_fd: RawFd = file.as_raw_fd();
+    let chunk = chunk.max(1);
+
+    let mut off = offset as libc::off_t;
+    let mut remaining = len;
+    let mut sent_total = 0u64;
+
+    while remaining > 0 {
+        let mut sent = remaining.min(chunk as u64) as libc::off_t;
+        // SAFETY: valid fds; `sent` is a valid in/out pointer. macOS writes
+        // the number of transferred bytes to it even when the call returns an
+        // error after a partial transfer.
+        let rc = unsafe { libc::sendfile(in_fd, out_fd, off, &mut sent, std::ptr::null_mut(), 0) };
+        if sent > 0 {
+            let sent = sent as u64;
+            sent_total += sent;
+            remaining -= sent;
+            off += sent as libc::off_t;
+        }
+        if rc == 0 {
+            if sent == 0 {
+                // EOF before we expected it: the file is shorter than requested.
+                break;
+            }
+            continue;
+        }
+
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        return Err(err);
+    }
+    Ok(sent_total)
+}
+
+#[cfg(target_os = "linux")]
+const HEADER_SEND_FLAGS: libc::c_int = libc::MSG_MORE | libc::MSG_NOSIGNAL;
+
+// Darwin has no MSG_MORE. MSG_NOSIGNAL still prevents a closed peer from
+// terminating the worker while the following sendfile call supplies payload.
+#[cfg(target_os = "macos")]
+const HEADER_SEND_FLAGS: libc::c_int = libc::MSG_NOSIGNAL;
+
 /// Send `header` and then `[offset, offset + len)` of `file` to `sock` in a
 /// single blocking step.
 ///
@@ -73,9 +129,9 @@ pub fn send_file_range(
 /// per-request cost on the serve path, since the payload copy itself is
 /// already zero-copy.
 ///
-/// The header goes out with `MSG_MORE` so the kernel holds it back and
-/// coalesces it with the first `sendfile` chunk into one TCP segment instead
-/// of emitting a tiny header-only packet.
+/// On Linux the header goes out with `MSG_MORE` so the kernel can coalesce it
+/// with the first `sendfile` chunk. macOS has no `MSG_MORE`, so it uses only
+/// `MSG_NOSIGNAL` and preserves correctness without that optimization.
 ///
 /// Returns the number of *payload* bytes sent (header bytes are not counted),
 /// so the caller can apply the same short-send check as [`send_file_range`].
@@ -97,7 +153,7 @@ pub fn send_header_and_file_range(
                 out_fd,
                 header[written..].as_ptr() as *const libc::c_void,
                 header.len() - written,
-                libc::MSG_MORE | libc::MSG_NOSIGNAL,
+                HEADER_SEND_FLAGS,
             )
         };
         if n < 0 {
@@ -116,8 +172,8 @@ pub fn send_header_and_file_range(
         written += n as usize;
     }
 
-    // `MSG_MORE` leaves the header corked; the sendfile below uncorks it by
-    // filling the segment. A zero-length payload would strand it, so flush.
+    // On Linux, `MSG_MORE` leaves the header corked and a zero-length payload
+    // would strand it. On macOS the header is already sent; this is harmless.
     if len == 0 {
         // SAFETY: valid fd; a zero-length send with no MSG_MORE flushes.
         unsafe { libc::send(out_fd, [].as_ptr(), 0, libc::MSG_NOSIGNAL) };
@@ -136,10 +192,9 @@ pub fn send_header_and_file_range(
 /// `sendfile` per segment keeps the whole read zero-copy instead of falling
 /// back to reading each page into a buffer and concatenating.
 ///
-/// The header goes out corked with `MSG_MORE`, so the kernel coalesces it with
-/// the first page's bytes instead of emitting a header-only packet. Successive
-/// `sendfile` calls append into the same socket buffer, so adjacent pages fill
-/// full segments rather than one packet per page.
+/// Linux corks the header with `MSG_MORE`, so the kernel can coalesce it with
+/// the first page's bytes. macOS sends the header with `MSG_NOSIGNAL` only;
+/// successive `sendfile` calls still preserve the same byte order.
 ///
 /// Returns the number of *payload* bytes sent (header bytes are not counted).
 /// A short return means some segment hit EOF early; the caller must treat that
@@ -160,7 +215,7 @@ pub fn send_header_and_file_ranges<F: AsRawFd>(
                 out_fd,
                 header[written..].as_ptr() as *const libc::c_void,
                 header.len() - written,
-                libc::MSG_MORE | libc::MSG_NOSIGNAL,
+                HEADER_SEND_FLAGS,
             )
         };
         if n < 0 {
@@ -181,8 +236,9 @@ pub fn send_header_and_file_ranges<F: AsRawFd>(
 
     let total: u64 = segments.iter().map(|(_, _, len)| *len).sum();
     if total == 0 {
-        // `MSG_MORE` left the header corked and no payload will uncork it.
-        // SAFETY: valid fd; a zero-length send with no MSG_MORE flushes.
+        // Linux needs a send without MSG_MORE to flush its corked header; on
+        // macOS this zero-length send is harmless.
+        // SAFETY: valid fd.
         unsafe { libc::send(out_fd, [].as_ptr(), 0, libc::MSG_NOSIGNAL) };
         return Ok(0);
     }
