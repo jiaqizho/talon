@@ -54,9 +54,11 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: Swatinem/rust-cache@v2
       - name: Build
-        run: cargo build --workspace --all-targets --all-features --locked
+        # talon-python's extension-module feature deliberately avoids linking
+        # libpython, so its Rust test executable is built in the Python job.
+        run: cargo build --workspace --exclude talon-python --all-targets --all-features --locked
       - name: Test
-        run: cargo test --workspace --all-features --locked
+        run: cargo test --workspace --exclude talon-python --all-features --locked
 
   fuse-mount:
     name: fuse mount e2e
@@ -502,6 +504,9 @@ jobs:
           # client's generated code; both binaries below need it.
           sudo apt-get update && sudo apt-get install -y protobuf-compiler
           python -m pip install --upgrade maturin pytest
+      - name: Test the Rust-side Python bindings
+        # Rust tests need libpython, so do not enable extension-module here.
+        run: cargo test -p talon-python --locked
       - name: Build the release binaries the tests drive
         run: |
           cargo build --release --locked \
