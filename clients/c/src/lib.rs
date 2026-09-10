@@ -14,11 +14,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use talon_rust_client::{
-    parse_uri as parse_rust_uri, Client as RustClient, Error as RustError, ObjectId,
+    parse_uri as parse_rust_uri, Client as RustClient, ClientBuilder, Error as RustError, ObjectId,
     ObjectStat as RustObjectStat, UriError,
 };
 
 const DEFAULT_BLOCK_SIZE: u32 = 256 << 20;
+const DEFAULT_MAX_IDLE_PER_ADDR: u32 = 8;
 
 const STATUS_OK: c_int = 0;
 const STATUS_INVALID_ARGUMENT: c_int = 1;
@@ -58,6 +59,9 @@ pub struct TalonClientOptions {
     /// Optional caller-owned callback executor. Without one, callbacks run on
     /// the Tokio runtime thread that completed the operation.
     pub callback_executor: *const TalonCallbackExecutor,
+    /// Maximum idle connections per peer in each pool. Zero uses the default 8.
+    /// Does not limit active connections.
+    pub max_idle_per_addr: u32,
 }
 
 /// Opaque client handle.
@@ -171,6 +175,7 @@ pub unsafe extern "C" fn talon_client_options_init(options: *mut TalonClientOpti
             TalonClientOptions {
                 block_size: DEFAULT_BLOCK_SIZE,
                 callback_executor: ptr::null(),
+                max_idle_per_addr: DEFAULT_MAX_IDLE_PER_ADDR,
             },
         );
     }
@@ -196,6 +201,7 @@ pub unsafe extern "C" fn talon_client_new(
             TalonClientOptions {
                 block_size: DEFAULT_BLOCK_SIZE,
                 callback_executor: ptr::null(),
+                max_idle_per_addr: DEFAULT_MAX_IDLE_PER_ADDR,
             }
         } else {
             unsafe { *options }
@@ -204,6 +210,11 @@ pub unsafe extern "C" fn talon_client_new(
             DEFAULT_BLOCK_SIZE
         } else {
             options.block_size
+        };
+        let max_idle_per_addr = if options.max_idle_per_addr == 0 {
+            DEFAULT_MAX_IDLE_PER_ADDR
+        } else {
+            options.max_idle_per_addr
         };
         let dispatcher = if options.callback_executor.is_null() {
             CallbackDispatcher::Inline
@@ -222,7 +233,11 @@ pub unsafe extern "C" fn talon_client_new(
             .enable_all()
             .build()
             .map_err(|error| (STATUS_RUNTIME_ERROR, error.to_string()))?;
-        let rust_client = RustClient::new(coordinator_addr, block_size)
+        let rust_client = ClientBuilder::default()
+            .with_coordinator(coordinator_addr)
+            .with_block_size(block_size)
+            .with_max_idle_per_addr(max_idle_per_addr as usize)
+            .build()
             .map_err(|error| (STATUS_INVALID_ARGUMENT, error.to_string()))?;
         let client = Box::new(TalonClient {
             inner: Arc::new(ClientInner {
@@ -843,6 +858,7 @@ mod tests {
         let mut options = TalonClientOptions {
             block_size: 0,
             callback_executor: ptr::null(),
+            max_idle_per_addr: 0,
         };
         unsafe {
             talon_client_options_init(&mut options);
@@ -864,6 +880,7 @@ mod tests {
         let options = TalonClientOptions {
             block_size,
             callback_executor: ptr::null(),
+            max_idle_per_addr: 0,
         };
         let mut client = ptr::null_mut();
         let status = unsafe { talon_client_new(coordinator_c.as_ptr(), &options, &mut client) };
@@ -1223,6 +1240,7 @@ mod tests {
         let options = TalonClientOptions {
             block_size: DEFAULT_BLOCK_SIZE,
             callback_executor: &executor,
+            max_idle_per_addr: 0,
         };
         let mut client = ptr::null_mut();
         let status = unsafe { talon_client_new(coordinator_c.as_ptr(), &options, &mut client) };

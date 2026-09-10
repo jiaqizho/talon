@@ -33,7 +33,8 @@ int talon_c_api_smoke_test(void) {
     const char *last_error;
 
     talon_client_options_init(&options);
-    if (options.block_size != (256u << 20) || options.callback_executor != NULL) {
+    if (options.block_size != (256u << 20) || options.callback_executor != NULL ||
+        options.max_idle_per_addr != 8) {
         return 1;
     }
 
@@ -45,6 +46,7 @@ int talon_c_api_smoke_test(void) {
         return 3;
     }
 
+    options.max_idle_per_addr = 32;
     if (talon_client_new("127.0.0.1:1", &options, &client) != TALON_STATUS_OK ||
         client == NULL) {
         return 4;

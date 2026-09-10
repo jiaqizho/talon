@@ -44,6 +44,9 @@ typedef struct talon_callback_executor {
 typedef struct talon_client_options {
     uint32_t block_size;
     const talon_callback_executor *callback_executor;
+    /* Maximum idle connections per peer in each pool. Zero uses the default 8.
+     * This does not limit active connections. */
+    uint32_t max_idle_per_addr;
 } talon_client_options;
 
 void talon_client_options_init(talon_client_options *options);

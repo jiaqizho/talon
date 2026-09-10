@@ -2,7 +2,10 @@ use std::sync::Arc;
 
 use crate::{Error, ObjectEntry, ObjectId, ObjectStat, UriError, Version};
 use futures::stream::{FuturesUnordered, StreamExt};
-use talon_cache_client::{plan_read, BlockReader, CoordinatorClient, PlacementCache};
+use talon_cache_client::pool::{DEFAULT_IDLE_TTL, DEFAULT_MAX_IDLE_PER_ADDR};
+use talon_cache_client::{
+    plan_read, BlockReader, ConnectionPool, CoordinatorClient, PlacementCache,
+};
 
 const PLACEMENT_TTL_MS: u64 = 30_000;
 const REPLICAS_K: u8 = 1;
@@ -15,22 +18,88 @@ pub struct Client {
     block_size: u32,
 }
 
-impl Client {
-    /// Construct a client without creating or selecting a Tokio runtime.
-    pub fn new(coordinator: impl Into<String>, block_size: u32) -> Result<Self, Error> {
+/// Collects client configuration without allocating connection pools or caches.
+///
+/// Defaults to 256 MiB blocks and 8 idle connections per peer address.
+/// A coordinator address must be supplied before [`build`](Self::build).
+pub struct ClientBuilder {
+    coordinator: String,
+    block_size: u32,
+    max_idle_per_addr: usize,
+}
+
+impl Default for ClientBuilder {
+    fn default() -> Self {
+        Self {
+            coordinator: String::new(),
+            block_size: 256 << 20,
+            max_idle_per_addr: DEFAULT_MAX_IDLE_PER_ADDR,
+        }
+    }
+}
+
+impl ClientBuilder {
+    /// Set the coordinator address (`host:port`).
+    pub fn with_coordinator(mut self, coordinator: impl Into<String>) -> Self {
+        self.coordinator = coordinator.into();
+        self
+    }
+
+    /// Set the block size in bytes; it must match the workers' block size.
+    pub fn with_block_size(mut self, block_size: u32) -> Self {
+        self.block_size = block_size;
+        self
+    }
+
+    /// Set the idle connection limit per peer in both coordinator and worker pools.
+    /// This does not cap in-flight connections or change the idle TTL and timeouts.
+    pub fn with_max_idle_per_addr(mut self, max_idle_per_addr: usize) -> Self {
+        self.max_idle_per_addr = max_idle_per_addr;
+        self
+    }
+
+    /// Validate configuration and construct a client without selecting a Tokio runtime.
+    pub fn build(self) -> Result<Client, Error> {
+        let Self {
+            coordinator,
+            block_size,
+            max_idle_per_addr,
+        } = self;
+        if coordinator.is_empty() {
+            return Err(Error::InvalidArgument(
+                "coordinator must be non-empty".into(),
+            ));
+        }
         if block_size == 0 {
             return Err(Error::InvalidArgument("block_size must be non-zero".into()));
         }
-        let coordinator = CoordinatorClient::new(coordinator);
+        if max_idle_per_addr == 0 {
+            return Err(Error::InvalidArgument(
+                "max_idle_per_addr must be non-zero".into(),
+            ));
+        }
+        // Keep control and data connections in separate pools.
+        let coordinator = CoordinatorClient::with_pool(
+            coordinator,
+            Arc::new(ConnectionPool::with_limits(
+                max_idle_per_addr,
+                DEFAULT_IDLE_TTL,
+            )),
+        );
         let cache = Arc::new(PlacementCache::new(PLACEMENT_TTL_MS));
-        let reader = BlockReader::new(coordinator.clone(), cache, REPLICAS_K);
-        Ok(Self {
+        let reader =
+            BlockReader::new(coordinator.clone(), cache, REPLICAS_K).with_worker_pool(Arc::new(
+                ConnectionPool::with_limits(max_idle_per_addr, DEFAULT_IDLE_TTL),
+            ));
+        Ok(Client {
             coordinator,
             reader,
             block_size,
         })
     }
+}
 
+impl Client {
     /// Address of the coordinator used by this client.
     pub fn coordinator_addr(&self) -> &str {
         self.coordinator.addr()
@@ -457,7 +526,14 @@ mod tests {
         let worker = mock_worker().await;
         let stat_calls = Arc::new(AtomicUsize::new(0));
         let coordinator = mock_read_coordinator(worker, size, Arc::clone(&stat_calls)).await;
-        (Client::new(coordinator, 8).unwrap(), stat_calls)
+        (
+            ClientBuilder::default()
+                .with_coordinator(coordinator)
+                .with_block_size(8)
+                .build()
+                .unwrap(),
+            stat_calls,
+        )
     }
 
     #[test]
@@ -498,16 +574,166 @@ mod tests {
     }
 
     #[test]
+    fn build_requires_a_coordinator() {
+        let error = ClientBuilder::default()
+            .build()
+            .err()
+            .expect("a coordinator must be provided");
+        assert!(matches!(error, Error::InvalidArgument(_)));
+        assert!(error.to_string().contains("coordinator"));
+    }
+
+    #[test]
+    fn build_uses_defaults_and_final_overrides() {
+        let default_client = ClientBuilder::default()
+            .with_coordinator("127.0.0.1:7000")
+            .build()
+            .unwrap();
+        assert_eq!(default_client.coordinator_addr(), "127.0.0.1:7000");
+        assert_eq!(default_client.block_size(), 256 * 1024 * 1024);
+
+        // Setters only collect configuration; validation uses the final values.
+        let client = ClientBuilder::default()
+            .with_block_size(0)
+            .with_max_idle_per_addr(0)
+            .with_coordinator("127.0.0.1:7001")
+            .with_max_idle_per_addr(1)
+            .with_block_size(1024)
+            .build()
+            .unwrap();
+        assert_eq!(client.coordinator_addr(), "127.0.0.1:7001");
+        assert_eq!(client.block_size(), 1024);
+    }
+
+    #[test]
     fn rejects_zero_block_size() {
-        let error = Client::new("127.0.0.1:7000", 0)
+        let error = ClientBuilder::default()
+            .with_coordinator("127.0.0.1:7000")
+            .with_block_size(0)
+            .build()
             .err()
             .expect("zero block size must fail");
         assert!(matches!(error, Error::InvalidArgument(_)));
     }
 
+    #[test]
+    fn rejects_zero_max_idle_per_addr() {
+        let error = ClientBuilder::default()
+            .with_coordinator("127.0.0.1:7000")
+            .with_max_idle_per_addr(0)
+            .build()
+            .err()
+            .expect("zero idle connection limit must fail");
+        assert!(matches!(error, Error::InvalidArgument(_)));
+        assert!(error.to_string().contains("max_idle_per_addr"));
+    }
+
+    #[tokio::test]
+    async fn max_idle_per_addr_controls_coordinator_and_worker_connection_reuse() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            for (limit, concurrent, second_batch_accepts) in
+                [(None, 10, 12), (Some(1), 3, 5), (Some(12), 14, 16)]
+            {
+                for worker in [false, true] {
+                    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let addr = listener.local_addr().unwrap().to_string();
+                    let accepts = Arc::new(AtomicUsize::new(0));
+                    // Hold each batch until every request has its own connection.
+                    // The idle limit must not cap concurrent requests.
+                    let barrier = Arc::new(tokio::sync::Barrier::new(concurrent));
+                    let count = Arc::clone(&accepts);
+                    let server = tokio::spawn(async move {
+                        loop {
+                            let (mut socket, _) = listener.accept().await.unwrap();
+                            count.fetch_add(1, Ordering::SeqCst);
+                            let barrier = Arc::clone(&barrier);
+                            tokio::spawn(async move {
+                                loop {
+                                    let mut header_bytes = [0_u8; HEADER_LEN];
+                                    if socket.read_exact(&mut header_bytes).await.is_err() {
+                                        return;
+                                    }
+                                    let header = FrameHeader::decode(&header_bytes).unwrap();
+                                    let mut payload = vec![0_u8; header.length as usize];
+                                    socket.read_exact(&mut payload).await.unwrap();
+                                    let response = if worker {
+                                        let mut frame = header_bytes.to_vec();
+                                        frame.extend_from_slice(&payload);
+                                        let (_, request): (_, RangeRequest) =
+                                            decode_request(&frame).unwrap();
+                                        assert_eq!(request.len, 8);
+                                        let mut response = response_header_ok(0, 8).to_vec();
+                                        response.extend_from_slice(&[7; 8]);
+                                        response
+                                    } else {
+                                        talon_transport::encode(
+                                            0,
+                                            &ControlMessage::ObjectStat {
+                                                size: 8,
+                                                version: "test-version".into(),
+                                            },
+                                        )
+                                        .unwrap()
+                                    };
+                                    barrier.wait().await;
+                                    socket.write_all(&response).await.unwrap();
+                                }
+                            });
+                        }
+                    });
+                    let coordinator = if worker {
+                        mock_read_coordinator(addr, 8, Arc::new(AtomicUsize::new(0))).await
+                    } else {
+                        addr
+                    };
+                    let builder = ClientBuilder::default()
+                        .with_coordinator(coordinator)
+                        .with_block_size(1024);
+                    let builder = match limit {
+                        Some(limit) => builder.with_max_idle_per_addr(limit),
+                        None => builder,
+                    };
+                    let client = builder.build().unwrap();
+                    let object = parse_uri("s3://bucket/key").unwrap();
+                    let stat = ObjectStat {
+                        size: 8,
+                        version: "test-version".into(),
+                    };
+                    for (client, expected_accepts) in
+                        [(client.clone(), concurrent), (client, second_batch_accepts)]
+                    {
+                        futures::future::join_all((0..concurrent).map(|_| async {
+                            if worker {
+                                assert_eq!(
+                                    client.read(&object, 0, Some(8), Some(&stat)).await.unwrap(),
+                                    vec![7; 8]
+                                );
+                            } else {
+                                assert_eq!(client.stat(&object).await.unwrap().size, 8);
+                            }
+                        }))
+                        .await;
+                        assert_eq!(
+                            accepts.load(Ordering::SeqCst),
+                            expected_accepts,
+                            "worker={worker}, limit={limit:?}"
+                        );
+                    }
+                    server.abort();
+                }
+            }
+        })
+        .await
+        .expect("idle limit must not block concurrent requests");
+    }
+
     #[tokio::test]
     async fn stat_returns_coordinator_metadata() {
-        let client = Client::new(mock_coordinator().await, 1024).unwrap();
+        let client = ClientBuilder::default()
+            .with_coordinator(mock_coordinator().await)
+            .with_block_size(1024)
+            .build()
+            .unwrap();
 
         let stat = client
             .stat(&parse_uri("s3://bucket/key").unwrap())
@@ -520,7 +746,11 @@ mod tests {
 
     #[tokio::test]
     async fn list_returns_existing_object_entries() {
-        let client = Client::new(mock_coordinator().await, 1024).unwrap();
+        let client = ClientBuilder::default()
+            .with_coordinator(mock_coordinator().await)
+            .with_block_size(1024)
+            .build()
+            .unwrap();
 
         let entries = client.list("s3/bucket/data").await.unwrap();
 
@@ -567,7 +797,11 @@ mod tests {
 
     #[tokio::test]
     async fn allocating_read_rejects_length_above_vec_capacity() {
-        let client = Client::new("127.0.0.1:1", 8).unwrap();
+        let client = ClientBuilder::default()
+            .with_coordinator("127.0.0.1:1")
+            .with_block_size(8)
+            .build()
+            .unwrap();
         let object = parse_uri("s3://bucket/key").unwrap();
         let too_large = isize::MAX as u64 + 1;
         let stat = ObjectStat {
@@ -631,7 +865,11 @@ mod tests {
         .await;
         let stat_calls = Arc::new(AtomicUsize::new(0));
         let coordinator = mock_read_coordinator(worker, 16, stat_calls).await;
-        let client = Client::new(coordinator, 8).unwrap();
+        let client = ClientBuilder::default()
+            .with_coordinator(coordinator)
+            .with_block_size(8)
+            .build()
+            .unwrap();
         let object = parse_uri("s3://bucket/key").unwrap();
         let stat = ObjectStat {
             size: 16,
@@ -668,7 +906,11 @@ mod tests {
         .await;
         let stat_calls = Arc::new(AtomicUsize::new(0));
         let coordinator = mock_read_coordinator(worker, 16, stat_calls).await;
-        let client = Client::new(coordinator, 8).unwrap();
+        let client = ClientBuilder::default()
+            .with_coordinator(coordinator)
+            .with_block_size(8)
+            .build()
+            .unwrap();
         let object = parse_uri("s3://bucket/key").unwrap();
         let stat = ObjectStat {
             size: 16,
@@ -695,7 +937,11 @@ mod tests {
         let worker = mock_short_worker().await;
         let stat_calls = Arc::new(AtomicUsize::new(0));
         let coordinator = mock_read_coordinator(worker, 8, stat_calls).await;
-        let client = Client::new(coordinator, 8).unwrap();
+        let client = ClientBuilder::default()
+            .with_coordinator(coordinator)
+            .with_block_size(8)
+            .build()
+            .unwrap();
         let object = parse_uri("s3://bucket/key").unwrap();
         let stat = ObjectStat {
             size: 8,
