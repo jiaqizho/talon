@@ -125,30 +125,30 @@ impl BlockReader {
     /// Metrics are collected into a fresh [`ReadStats`]; use
     /// [`with_stats`](Self::with_stats) to share an existing one.
     pub fn new(coordinator: CoordinatorClient, cache: Arc<PlacementCache>, replicas_k: u8) -> Self {
-        Self::with_stats(coordinator, cache, replicas_k, ReadStats::new())
-    }
-
-    /// Like [`new`](Self::new) but records metrics into the provided
-    /// [`ReadStats`], so a caller (e.g. the mount layer) can observe the same
-    /// counters this reader bumps.
-    pub fn with_stats(
-        coordinator: CoordinatorClient,
-        cache: Arc<PlacementCache>,
-        replicas_k: u8,
-        stats: ReadStats,
-    ) -> Self {
         let membership = Arc::new(MembershipCache::new(cache.ttl_ms()));
         Self {
             coordinator,
             cache,
             replicas_k: replicas_k.max(1),
-            stats,
+            stats: ReadStats::new(),
             worker_pool: Arc::new(ConnectionPool::new()),
             membership,
             membership_refresh: Arc::new(tokio::sync::Mutex::new(())),
             zone: None,
             zone_observer: Arc::new(crate::metrics::NoopZoneReadObserver),
         }
+    }
+
+    /// Record metrics into the provided counters, shared by reader clones.
+    pub fn with_stats(mut self, stats: ReadStats) -> Self {
+        self.stats = stats;
+        self
+    }
+
+    /// Use the provided worker connection pool, shared by reader clones.
+    pub fn with_worker_pool(mut self, worker_pool: Arc<ConnectionPool>) -> Self {
+        self.worker_pool = worker_pool;
+        self
     }
 
     /// Configure zone-affine placement (ADR 0006).
@@ -1072,6 +1072,40 @@ mod tests {
             }
         });
         addr
+    }
+
+    #[tokio::test]
+    async fn stats_and_worker_pool_builders_are_independent() {
+        for stats_first in [false, true] {
+            let hits = Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let worker_addr = mock_worker(hits).await;
+            let coordinator = mock_coordinator(worker_addr.clone()).await;
+            let stats = ReadStats::new();
+            let pool = Arc::new(ConnectionPool::with_limits(
+                1,
+                crate::pool::DEFAULT_IDLE_TTL,
+            ));
+            let reader = BlockReader::new(
+                CoordinatorClient::new(coordinator),
+                Arc::new(PlacementCache::new(10_000)),
+                1,
+            );
+            let reader = if stats_first {
+                reader
+                    .with_stats(stats.clone())
+                    .with_worker_pool(Arc::clone(&pool))
+            } else {
+                reader
+                    .with_worker_pool(Arc::clone(&pool))
+                    .with_stats(stats.clone())
+            };
+
+            let bytes = reader.clone().read_block(&block(), 0, 64, 0).await.unwrap();
+            assert_eq!(bytes.len(), 64);
+            assert_eq!(stats.snapshot().bytes_served, 64);
+            assert_eq!(stats.snapshot().worker_fetches, 1);
+            assert_eq!(pool.idle_count(&worker_addr), 1);
+        }
     }
 
     #[tokio::test]

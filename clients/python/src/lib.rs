@@ -22,7 +22,8 @@ use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use talon_rust_client::{
-    parse_uri, Client as RustClient, Error as RustError, ObjectStat as RustObjectStat,
+    parse_uri, Client as RustClient, ClientBuilder, Error as RustError,
+    ObjectStat as RustObjectStat,
 };
 
 /// Capture language context while the GIL and caller context are still active.
@@ -172,18 +173,21 @@ impl Client {
     /// `block_size` must match the workers' configured block size; placement is
     /// computed per block, so a mismatch addresses the wrong blocks. It
     /// defaults to the worker default of 256 MiB.
+    /// `max_idle_per_addr` is the positive idle connection limit per peer in
+    /// both coordinator and worker pools; it does not limit active connections.
     #[new]
-    #[pyo3(signature = (coordinator, *, block_size = 256 << 20))]
-    fn new(coordinator: &str, block_size: u32) -> PyResult<Self> {
-        if block_size == 0 {
-            return Err(PyValueError::new_err("block_size must be non-zero"));
-        }
+    #[pyo3(signature = (coordinator, *, block_size = 256 << 20, max_idle_per_addr = 8))]
+    fn new(coordinator: &str, block_size: u32, max_idle_per_addr: usize) -> PyResult<Self> {
+        let client = ClientBuilder::default()
+            .with_coordinator(coordinator)
+            .with_block_size(block_size)
+            .with_max_idle_per_addr(max_idle_per_addr)
+            .build()
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .map_err(io_err)?;
-        let client = RustClient::new(coordinator, block_size)
-            .map_err(|error| PyValueError::new_err(error.to_string()))?;
         Ok(Self {
             runtime: Arc::new(runtime),
             client: Arc::new(client),
@@ -366,6 +370,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn constructor_accepts_pool_limit_keyword_and_rejects_zero() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let client_type = py.get_type_bound::<Client>();
+            client_type.call1(("127.0.0.1:7000",)).unwrap();
+            let kwargs = pyo3::types::PyDict::new_bound(py);
+            for limit in [1, 32] {
+                kwargs.set_item("max_idle_per_addr", limit).unwrap();
+                client_type
+                    .call(("127.0.0.1:7000",), Some(&kwargs))
+                    .unwrap();
+            }
+            kwargs.set_item("max_idle_per_addr", 0).unwrap();
+            let error = client_type
+                .call(("127.0.0.1:7000",), Some(&kwargs))
+                .unwrap_err();
+            assert!(error.is_instance_of::<PyValueError>(py));
+        });
+    }
+
+    #[test]
     fn completing_partial_stat_preserves_caller_version() {
         let completed = complete_known_stat(
             Some("caller-version".into()),
@@ -383,7 +408,7 @@ mod tests {
     #[test]
     fn invalid_read_argument_raises_value_error() {
         pyo3::prepare_freethreaded_python();
-        let client = Client::new("unused", 1).unwrap();
+        let client = Client::new("unused", 1, 8).unwrap();
         let oversized = (isize::MAX as u64).saturating_add(1);
 
         Python::with_gil(|py| {
@@ -407,7 +432,7 @@ mod tests {
     #[test]
     fn coordinator_failure_raises_io_error() {
         pyo3::prepare_freethreaded_python();
-        let client = Client::new("127.0.0.1:0", 1).unwrap();
+        let client = Client::new("127.0.0.1:0", 1, 8).unwrap();
 
         Python::with_gil(|py| {
             let error = match client.stat(py, "s3://bucket/key", None) {
