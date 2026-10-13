@@ -11,10 +11,12 @@ use talon_coordinator::{
     Membership, MemoryStateStore, PlacementService, RendezvousPlacement, StateBackend,
 };
 use talon_core::{
-    NamespacePolicy, NodeHealth, NodeInfo, NodeRole, ObjectNamespace, WorkloadIdentity,
+    NodeHealth, NodeInfo, NodeRole, ObjectNamespace, ObjectNamespacePolicy, WorkloadIdentity,
     WorkloadRole,
 };
-use talon_metadata::{ClusterCapabilities, MappingRevision, MetadataStore, NamespaceId};
+use talon_metadata::{
+    ClusterCapabilities, MappingRevision, MetadataStore, NamespaceId as MetadataNamespaceId,
+};
 use talon_transport::control_tls::ControlTlsChannel;
 use talon_transport::frame::HEADER_LEN;
 use talon_transport::{codec, ControlMessage, FrameHeader};
@@ -699,7 +701,8 @@ impl Coordinator {
         attempt_deadline: tokio::time::Instant,
     ) -> anyhow::Result<(TcpStream, ControlMessage)> {
         let mut buf = codec::encode(0, message)?;
-        talon_transport::envelope::outbound(&mut buf, address)?;
+        let namespace = REQUEST_NAMESPACE.try_with(Clone::clone).unwrap_or_default();
+        talon_transport::envelope::outbound_namespace(&mut buf, address, &namespace)?;
         stream.write_all(&buf).await?;
         stream.flush().await?;
 
@@ -1220,7 +1223,7 @@ fn spawn_revision_propagation(
     observability: Arc<CoordinatorObservability>,
     metadata: Arc<dyn MetadataStore>,
     channel: ControlTlsChannel,
-    policy: NamespacePolicy,
+    policy: ObjectNamespacePolicy,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -1242,7 +1245,7 @@ async fn propagate_mapping_revisions(
     observability: &CoordinatorObservability,
     metadata: &dyn MetadataStore,
     channel: &ControlTlsChannel,
-    policy: &NamespacePolicy,
+    policy: &ObjectNamespacePolicy,
 ) -> anyhow::Result<()> {
     let workers = observability.serving_workers().await?;
     let mut revisions = HashMap::<ObjectNamespace, MappingRevision>::new();
@@ -1259,7 +1262,7 @@ async fn propagate_mapping_revisions(
         let revision = if let Some(revision) = revisions.get(namespace) {
             *revision
         } else {
-            let namespace_id = NamespaceId::new(namespace.to_string())?;
+            let namespace_id = MetadataNamespaceId::new(namespace.to_string())?;
             let revision = match metadata.mapping_revision(&namespace_id).await {
                 Ok(revision) => revision,
                 Err(error) => {
@@ -1319,7 +1322,7 @@ struct RevisionTarget {
 
 fn revision_targets(
     workers: &[talon_core::NodeStatus],
-    policy: &NamespacePolicy,
+    policy: &ObjectNamespacePolicy,
 ) -> Vec<RevisionTarget> {
     workers
         .iter()
@@ -1582,6 +1585,11 @@ async fn serve_worker_control(
     result
 }
 
+tokio::task_local! {
+    // Bounded to one incoming request, including all serial metadata proxy attempts.
+    static REQUEST_NAMESPACE: talon_core::NamespaceId;
+}
+
 async fn handle_conn<S>(
     mut stream: S,
     state: Arc<Coordinator>,
@@ -1629,7 +1637,12 @@ where
                         detail: Some(error),
                     }
                 } else {
-                    state.dispatch(message).await
+                    REQUEST_NAMESPACE
+                        .scope(
+                            metadata.namespace.clone().unwrap_or_default(),
+                            state.dispatch(message),
+                        )
+                        .await
                 };
                 let error = matches!(
                     &reply,
@@ -1712,8 +1725,8 @@ mod tests {
         WorkloadIdentity::new("cluster.example", "cluster-a", WorkloadRole::Worker, id).unwrap()
     }
 
-    fn revision_policy() -> NamespacePolicy {
-        NamespacePolicy::from_toml(
+    fn revision_policy() -> ObjectNamespacePolicy {
+        ObjectNamespacePolicy::from_toml(
             "version = 1\n\
              [[workers]]\n\
              node_id = \"worker-1\"\n\
@@ -2232,6 +2245,39 @@ mod tests {
         );
         drop(held);
         assert_eq!(coordinator.worker_proxy_slots.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn proxy_keeps_request_namespace_on_reused_worker_connections() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            for namespace in ["a", "b", "default"] {
+                let (_, _, metadata) = read_control(&mut stream).await.unwrap().unwrap();
+                assert_eq!(
+                    metadata.namespace.unwrap_or_default().effective_name(),
+                    namespace
+                );
+                stream
+                    .write_all(&codec::encode(0, &stat_reply()).unwrap())
+                    .await
+                    .unwrap();
+                stream.flush().await.unwrap();
+            }
+        });
+        let coordinator = proxy_test_coordinator();
+        let workers = vec![proxy_worker(address)];
+        for namespace in ["a", "b", "default"] {
+            let reply = REQUEST_NAMESPACE
+                .scope(
+                    talon_core::NamespaceId::named(namespace),
+                    coordinator.proxy_to_workers(&workers, stat_request()),
+                )
+                .await;
+            assert_eq!(reply, stat_reply());
+        }
+        server.await.unwrap();
     }
 
     #[tokio::test]

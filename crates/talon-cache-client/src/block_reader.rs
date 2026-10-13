@@ -628,7 +628,7 @@ fn cache_block_error(error: BlockReadError) -> CacheReadError {
     }
 }
 
-/// Candidate fallback cannot hide authoritative errors or evade tenant limits.
+/// Candidate fallback cannot hide authoritative errors or evade namespace limits.
 fn replica_retryable(error: &WorkerError) -> bool {
     match error {
         WorkerError::Remote(error) => !matches!(

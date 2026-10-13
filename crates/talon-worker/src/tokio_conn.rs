@@ -23,7 +23,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use talon_core::{RequestId, TenantId, Version};
+use talon_core::{NamespaceId, RequestId, Version};
 use talon_transport::data;
 use talon_transport::frame::{MsgType, HEADER_LEN};
 use talon_transport::{codec, ControlMessage, DataErrorCode, FrameHeader};
@@ -36,8 +36,8 @@ use crate::{send_file_range, ServeOutcome, WorkerObservability, WorkerRuntime, D
 // Source version and its caller-supplied total length.
 type PinnedVersion = (Version, u64);
 
-/// Decode origin-backed coordinates, the optional exact version, and tenant.
-fn decode_range_with_tenant(
+/// Decode origin-backed coordinates, the optional exact version, and namespace.
+fn decode_range_with_namespace(
     header: &FrameHeader,
     payload: &[u8],
 ) -> Result<
@@ -45,7 +45,7 @@ fn decode_range_with_tenant(
         FrameHeader,
         data::RangeRequest,
         Option<PinnedVersion>,
-        TenantId,
+        NamespaceId,
     ),
     talon_transport::DataError,
 > {
@@ -55,11 +55,11 @@ fn decode_range_with_tenant(
     match header.msg_type {
         MsgType::GetRange => {
             let (frame, request) = data::decode_request(&full)?;
-            Ok((frame, request, None, TenantId::Unattributed))
+            Ok((frame, request, None, NamespaceId::Unattributed))
         }
-        MsgType::GetRangeTenant => {
-            let (frame, scoped) = data::decode_tenant_request(&full)?;
-            Ok((frame, scoped.request, None, scoped.tenant))
+        MsgType::GetRangeNamespace => {
+            let (frame, scoped) = data::decode_namespace_request(&full)?;
+            Ok((frame, scoped.request, None, scoped.namespace))
         }
         MsgType::GetVersionedRange => {
             let (frame, versioned) = data::decode_versioned_request(&full)?;
@@ -67,38 +67,38 @@ fn decode_range_with_tenant(
                 frame,
                 versioned.request,
                 Some((versioned.version, versioned.object_len)),
-                TenantId::Unattributed,
+                NamespaceId::Unattributed,
             ))
         }
-        MsgType::GetVersionedRangeTenant => {
-            let (frame, scoped) = data::decode_versioned_tenant_request(&full)?;
+        MsgType::GetVersionedRangeNamespace => {
+            let (frame, scoped) = data::decode_versioned_namespace_request(&full)?;
             Ok((
                 frame,
                 scoped.request.request,
                 Some((scoped.request.version, scoped.request.object_len)),
-                scoped.tenant,
+                scoped.namespace,
             ))
         }
         other => Err(talon_transport::DataError::NotGetRange(other)),
     }
 }
 
-/// Decode a `GetCachedRange` or `GetCachedRangeTenant` frame into its cache-only
-/// request and the tenant it declared (`Unattributed` for a plain
+/// Decode a `GetCachedRange` or `GetCachedRangeNamespace` frame into its cache-only
+/// request and the namespace it declared (`Unattributed` for a plain
 /// `GetCachedRange`).
-fn decode_cached_range_with_tenant(
+fn decode_cached_range_with_namespace(
     header: &FrameHeader,
     payload: &[u8],
-) -> Result<(FrameHeader, data::CachedRangeRequest, TenantId), talon_transport::DataError> {
+) -> Result<(FrameHeader, data::CachedRangeRequest, NamespaceId), talon_transport::DataError> {
     let mut full = Vec::with_capacity(HEADER_LEN + payload.len());
     full.extend_from_slice(&header.encode());
     full.extend_from_slice(payload);
-    if header.msg_type == MsgType::GetCachedRangeTenant {
-        let (frame, scoped) = data::decode_cached_tenant_request(&full)?;
-        Ok((frame, scoped.request, scoped.tenant))
+    if header.msg_type == MsgType::GetCachedRangeNamespace {
+        let (frame, scoped) = data::decode_cached_namespace_request(&full)?;
+        Ok((frame, scoped.request, scoped.namespace))
     } else {
         let (frame, req) = data::decode_cached_request(&full)?;
-        Ok((frame, req, TenantId::Unattributed))
+        Ok((frame, req, NamespaceId::Unattributed))
     }
 }
 
@@ -175,6 +175,21 @@ async fn handle_request(
     request_started: Instant,
 ) -> anyhow::Result<Option<TcpStream>> {
     let response_version = header.version;
+    let selected = match worker.for_request(header, payload).await {
+        Ok(selected) => selected,
+        Err(error) => {
+            let error = talon_transport::envelope::response_version(
+                data::encode_typed_error(header.request_id, error.code, error.message),
+                header.version,
+            );
+            stream.write_all(&error).await?;
+            stream.flush().await?;
+            // Raw PUT bodies may follow; close instead of interpreting them as a frame.
+            return Ok(None);
+        }
+    };
+    let worker = &selected;
+
     // A write (Put) or delete (Delete) is handled here and loops; only a
     // GetRange falls through to the read-serve path below.
     if header.msg_type == MsgType::Put {
@@ -234,7 +249,7 @@ async fn handle_request(
         return Ok(Some(stream));
     }
     if header.msg_type == MsgType::GetCachedRange
-        || header.msg_type == MsgType::GetCachedRangeTenant
+        || header.msg_type == MsgType::GetCachedRangeNamespace
     {
         handle_cached_range(
             &mut stream,
@@ -254,9 +269,9 @@ async fn handle_request(
     if !matches!(
         header.msg_type,
         MsgType::GetRange
-            | MsgType::GetRangeTenant
+            | MsgType::GetRangeNamespace
             | MsgType::GetVersionedRange
-            | MsgType::GetVersionedRangeTenant
+            | MsgType::GetVersionedRangeNamespace
     ) {
         let mut err = data::encode_typed_error(
             header.request_id,
@@ -273,7 +288,7 @@ async fn handle_request(
         return Ok(Some(stream));
     }
 
-    let (h, req, expected_version, tenant) = match decode_range_with_tenant(header, payload) {
+    let (h, req, expected_version, namespace) = match decode_range_with_namespace(header, payload) {
         Ok(v) => v,
         Err(e) => {
             let mut err = data::encode_typed_error(
@@ -292,14 +307,14 @@ async fn handle_request(
         }
     };
 
-    // The declared tenant is attacker-controlled on the unauthenticated data
+    // The declared namespace is attacker-controlled on the unauthenticated data
     // plane; reject an empty or over-long name before it is used as a cell
     // key or telemetry label. `Unattributed` always validates.
-    if let Err(e) = tenant.validate() {
+    if let Err(e) = namespace.validate() {
         let mut err = data::encode_typed_error(
             h.request_id,
             DataErrorCode::InvalidRequest,
-            format!("invalid tenant: {e}"),
+            format!("invalid namespace: {e}"),
         );
         err[2] = response_version;
         talon_telemetry::outcome("error");
@@ -368,12 +383,12 @@ async fn handle_request(
         return Ok(Some(stream));
     }
 
-    if let Err(throttled) = worker.rate_limiter().admit(&tenant, req.len) {
+    if let Err(throttled) = worker.rate_limiter().admit(worker.namespace(), req.len) {
         let mut err = data::encode_typed_error(
             h.request_id,
             DataErrorCode::RateLimited,
             format!(
-                "tenant rate limit exceeded on {}; retry after {} ms",
+                "namespace rate limit exceeded on {}; retry after {} ms",
                 throttled.metric.label(),
                 throttled.retry_after.as_millis()
             ),
@@ -589,7 +604,7 @@ async fn handle_cached_range(
     request_started: Instant,
 ) -> std::io::Result<()> {
     let response_version = header.version;
-    let (decoded, request, tenant) = match decode_cached_range_with_tenant(header, payload) {
+    let (decoded, request, namespace) = match decode_cached_range_with_namespace(header, payload) {
         Ok(value) => value,
         Err(error) => {
             let mut reply = data::encode_typed_error(
@@ -611,11 +626,11 @@ async fn handle_cached_range(
             return Ok(());
         }
     };
-    if let Err(error) = tenant.validate() {
+    if let Err(error) = namespace.validate() {
         let mut reply = data::encode_typed_error(
             decoded.request_id,
             DataErrorCode::InvalidRequest,
-            format!("invalid tenant: {error}"),
+            format!("invalid namespace: {error}"),
         );
         reply[2] = response_version;
         if talon_transport::Flags(u16::from_be_bytes([reply[4], reply[5]]))
@@ -669,14 +684,14 @@ async fn handle_cached_range(
         return Ok(());
     }
     // Meter the cache-only read too, so a resident-version read cannot escape
-    // the tenant's read_iops / read_throughput limits (a plain GetCachedRange
-    // carries no tenant and is charged to Unattributed under the default).
-    if let Err(throttled) = worker.rate_limiter().admit(&tenant, request.len) {
+    // the namespace's read_iops / read_throughput limits (a plain GetCachedRange
+    // without namespace metadata is charged to the default namespace).
+    if let Err(throttled) = worker.rate_limiter().admit(worker.namespace(), request.len) {
         let mut reply = data::encode_typed_error(
             decoded.request_id,
             DataErrorCode::RateLimited,
             format!(
-                "tenant rate limit exceeded on {}; retry after {} ms",
+                "namespace rate limit exceeded on {}; retry after {} ms",
                 throttled.metric.label(),
                 throttled.retry_after.as_millis()
             ),
@@ -925,7 +940,7 @@ async fn handle_put(
             .write_object(&req.object, bytes::Bytes::from(body))
             .await
     } else {
-        let staged = tempfile::NamedTempFile::new()?;
+        let staged = worker.staging_file()?;
         let file = staged.reopen()?;
         let mut file = tokio::fs::File::from_std(file);
         let mut remaining = req.body_len;

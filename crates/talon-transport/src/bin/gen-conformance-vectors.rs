@@ -281,6 +281,28 @@ fn vectors() -> Vec<Vector> {
             2,
         ),
     });
+    for (name, source) in [
+        ("v3.range.namespace", "data.range_request"),
+        ("v3.range.context_namespace", "v2.range.context"),
+        ("v3.load.namespace", "control.load_block"),
+    ] {
+        let mut bytes = result
+            .iter()
+            .find(|v| v.name == source)
+            .unwrap()
+            .bytes
+            .clone();
+        talon_transport::envelope::encode_namespace(
+            &mut bytes,
+            &talon_core::NamespaceId::named("acme"),
+        )
+        .unwrap();
+        result.push(Vector {
+            name,
+            note: "v3 requires namespace acme; original business payload unchanged",
+            bytes,
+        });
+    }
     use talon_core::worker_membership::*;
     result.push(control(
         "control.membership_instances",

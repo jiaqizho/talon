@@ -23,7 +23,7 @@ use std::path::PathBuf;
 
 use crate::status::MAX_STATUS_FIELD_BYTES;
 use crate::{
-    ControlTlsConfig, ControlTlsConfigPatch, Error, NamespacePolicy, ObjectNamespace,
+    ControlTlsConfig, ControlTlsConfigPatch, Error, ObjectNamespace, ObjectNamespacePolicy,
     RateLimitPolicy, Result,
 };
 
@@ -122,7 +122,7 @@ pub struct WorkerConfig {
     /// Optional mTLS material for the privileged coordinator-worker channel.
     pub control_tls: Option<ControlTlsConfig>,
     /// Operator-owned grants loaded from mounted static policy data.
-    pub namespace_policy: Option<NamespacePolicy>,
+    pub namespace_policy: Option<ObjectNamespacePolicy>,
     /// Stable node identity; defaults to the RPC listen address when unset.
     pub node_id: Option<String>,
     /// Control-plane heartbeat interval in milliseconds. After a detected failure,
@@ -266,10 +266,57 @@ pub struct WorkerConfig {
     /// or by the Tokio runtime worker-thread count on the fallback path.
     /// Idle accepted connections also consume this budget.
     pub data_plane_connections_per_thread: usize,
-    /// Static per-tenant rate-limit policy. Disabled unless a `[rate_limits]`
+    /// Static per-namespace rate-limit policy. Disabled unless a `[rate_limits]`
     /// table sets `enabled = true`. This is the local, single-worker stage of
-    /// the eventual-global-tenant-rate-limits design.
+    /// the eventual-global-namespace-rate-limits design.
     pub rate_limits: RateLimitPolicy,
+    /// Optional named cache policies; unknown namespaces inherit worker defaults.
+    pub namespaces: std::collections::BTreeMap<String, NamespaceCacheConfig>,
+}
+
+/// Per-namespace cache overrides. Omitted fields inherit the worker defaults.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NamespaceCacheConfig {
+    pub l2_page_size_bytes: Option<u64>,
+    pub l1_page_size_bytes: Option<u64>,
+    pub page_tti_hours: Option<u64>,
+    pub page_access_checkpoint_interval_minutes: Option<u64>,
+    pub page_gc_interval_minutes: Option<u64>,
+    pub paged_miss_run_concurrency: Option<usize>,
+}
+
+impl WorkerConfig {
+    /// Resolve cache settings without changing process-wide resource budgets.
+    pub fn for_namespace(&self, namespace: &crate::NamespaceId) -> Result<Self> {
+        namespace
+            .validate()
+            .map_err(|e| Error::Other(e.to_string()))?;
+        let mut result = self.clone();
+        result.namespaces.clear();
+        if let Some(overrides) = self.namespaces.get(namespace.effective_name()) {
+            if let Some(value) = overrides.l2_page_size_bytes {
+                result.l2_page_size_bytes = value;
+            }
+            if let Some(value) = overrides.l1_page_size_bytes {
+                result.l1_page_size_bytes = value;
+            }
+            if let Some(value) = overrides.page_tti_hours {
+                result.page_tti_hours = value;
+            }
+            if let Some(value) = overrides.page_access_checkpoint_interval_minutes {
+                result.page_access_checkpoint_interval_minutes = value;
+            }
+            if let Some(value) = overrides.page_gc_interval_minutes {
+                result.page_gc_interval_minutes = value;
+            }
+            if let Some(value) = overrides.paged_miss_run_concurrency {
+                result.paged_miss_run_concurrency = value;
+            }
+        }
+        result.validate()?;
+        Ok(result)
+    }
 }
 
 /// Read the Azure SAS token from the environment (`TALON_WORKER_AZURE_SAS`).
@@ -368,6 +415,7 @@ impl Default for WorkerConfig {
             data_plane_rings: 0,
             data_plane_connections_per_thread: 8192,
             rate_limits: RateLimitPolicy::default(),
+            namespaces: Default::default(),
         }
     }
 }
@@ -393,7 +441,7 @@ pub struct WorkerConfigPatch {
     pub cluster_id: Option<String>,
     /// Optional `[control_tls]` block.
     pub control_tls: Option<ControlTlsConfigPatch>,
-    /// Path to a static namespace authorization policy.
+    /// Path to a static object namespace authorization policy.
     pub namespace_policy_path: Option<PathBuf>,
     /// Override for [`WorkerConfig::node_id`].
     pub node_id: Option<String>,
@@ -491,8 +539,9 @@ pub struct WorkerConfigPatch {
     pub data_plane_rings: Option<usize>,
     /// Override for [`WorkerConfig::data_plane_connections_per_thread`].
     pub data_plane_connections_per_thread: Option<usize>,
-    /// Optional `[rate_limits]` table: the per-tenant rate-limit policy.
+    /// Optional `[rate_limits]` table: the per-namespace rate-limit policy.
     pub rate_limits: Option<RateLimitPolicy>,
+    pub namespaces: Option<std::collections::BTreeMap<String, NamespaceCacheConfig>>,
 }
 
 impl Patch for WorkerConfigPatch {
@@ -595,6 +644,7 @@ impl Patch for WorkerConfigPatch {
                 .data_plane_connections_per_thread
                 .or(base.data_plane_connections_per_thread),
             rate_limits: self.rate_limits.or(base.rate_limits),
+            namespaces: self.namespaces.or(base.namespaces),
         }
     }
 }
@@ -697,7 +747,7 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
         default: None,
         cli: false,
         secret: false,
-        help: "Mounted static namespace authorization policy (TOML).",
+        help: "Mounted static object namespace authorization policy (TOML).",
     },
     ConfigVar {
         env: "TALON_WORKER_HEARTBEAT_INTERVAL_MS",
@@ -1235,6 +1285,7 @@ impl WorkerConfigPatch {
                 .transpose()?,
             // The [rate_limits] table is file-only; env does not override it.
             rate_limits: None,
+            namespaces: None,
         })
     }
 }
@@ -1262,7 +1313,7 @@ impl WorkerConfig {
         let namespace_policy = merged
             .namespace_policy_path
             .as_deref()
-            .map(NamespacePolicy::from_file)
+            .map(ObjectNamespacePolicy::from_file)
             .transpose()?;
         let cfg = WorkerConfig {
             // Advertise the routable address if set, else fall back to the bind
@@ -1374,6 +1425,7 @@ impl WorkerConfig {
                 .data_plane_connections_per_thread
                 .unwrap_or(d.data_plane_connections_per_thread),
             rate_limits: merged.rate_limits.unwrap_or(d.rate_limits),
+            namespaces: merged.namespaces.unwrap_or(d.namespaces),
         };
         cfg.validate()?;
         Ok(cfg)
@@ -1414,6 +1466,9 @@ impl WorkerConfig {
         }
         if self.cluster_id.is_empty() {
             return Err(Error::Other("cluster_id must not be empty".into()));
+        }
+        for name in self.namespaces.keys() {
+            self.for_namespace(&crate::NamespaceId::named(name))?;
         }
         self.rate_limits
             .validate()
@@ -2069,7 +2124,7 @@ mod tests {
 
         config.node_id = Some("worker-a".into());
         config.namespace_policy = Some(
-            NamespacePolicy::from_toml(
+            ObjectNamespacePolicy::from_toml(
                 "version = 1\n\
                  [[workers]]\n\
                  node_id = \"worker-a\"\n\
@@ -2956,5 +3011,74 @@ mod tests {
         };
         let err = FuseConfig::resolve(Default::default(), Default::default(), cli).unwrap_err();
         assert!(err.to_string().contains("255"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod namespace_tests {
+    use super::*;
+    #[test]
+    fn reserved_namespace_names_fail_configuration_validation() {
+        for name in ["worker_identity", ".worker.lock"] {
+            let mut cfg = WorkerConfig::default();
+            cfg.namespaces
+                .insert(name.into(), NamespaceCacheConfig::default());
+            assert!(cfg.validate().unwrap_err().to_string().contains("reserved"));
+        }
+    }
+
+    #[test]
+    fn namespaces_cannot_override_block_size() {
+        for name in ["default", "analytics"] {
+            let error = WorkerConfigPatch::from_toml(&format!(
+                "[namespaces.{name}]\nblock_size = 67108864\n"
+            ))
+            .unwrap_err();
+            assert!(error.to_string().contains("block_size"), "{error}");
+        }
+    }
+
+    #[test]
+    fn namespace_overrides_inherit_and_validate_complete_geometry() {
+        let cfg = WorkerConfig::default();
+        let mut cfg = cfg;
+        let patch = WorkerConfigPatch::from_toml(
+            r#"
+[namespaces.acme]
+l2_page_size_bytes = 1048576
+page_tti_hours = 2
+[namespaces.default]
+l2_page_size_bytes = 2097152
+page_tti_hours = 4
+"#,
+        )
+        .unwrap();
+        cfg.namespaces = patch.namespaces.unwrap();
+        cfg.validate().unwrap();
+        let acme = cfg
+            .for_namespace(&crate::NamespaceId::named("acme"))
+            .unwrap();
+        assert_eq!(acme.block_size, cfg.block_size);
+        assert_eq!(acme.l2_page_size_bytes, 1048576);
+        assert_eq!(acme.page_tti_hours, 2);
+        assert_eq!(acme.capacity_bytes, cfg.capacity_bytes);
+        assert_eq!(
+            cfg.for_namespace(&crate::NamespaceId::Unattributed)
+                .unwrap()
+                .block_size,
+            cfg.block_size
+        );
+        assert_eq!(
+            cfg.for_namespace(&crate::NamespaceId::named("unknown"))
+                .unwrap()
+                .block_size,
+            cfg.block_size
+        );
+        cfg.namespaces.get_mut("acme").unwrap().l2_page_size_bytes = Some(3);
+        assert!(cfg.validate().is_err());
+        cfg.namespaces.clear();
+        cfg.namespaces
+            .insert("../escape".into(), NamespaceCacheConfig::default());
+        assert!(cfg.validate().is_err());
     }
 }

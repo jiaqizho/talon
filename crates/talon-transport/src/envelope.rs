@@ -1,4 +1,4 @@
-//! Protocol v2 request-only metadata. Responses retain their original body.
+//! Protocol v2 trace and v3 namespace request-only metadata. Responses retain their original body.
 use crate::frame::{FrameError, FrameHeader, MsgType, HEADER_LEN};
 use talon_telemetry::TraceContext;
 
@@ -10,17 +10,19 @@ pub fn supports_v2(kind: MsgType) -> bool {
         kind,
         MsgType::Control
             | MsgType::GetRange
-            | MsgType::GetRangeTenant
+            | MsgType::GetRangeNamespace
             | MsgType::GetCachedRange
-            | MsgType::GetCachedRangeTenant
+            | MsgType::GetCachedRangeNamespace
             | MsgType::GetVersionedRange
-            | MsgType::GetVersionedRangeTenant
+            | MsgType::GetVersionedRangeNamespace
     )
 }
 
-/// Parsed metadata has no heap allocation. Invalid trace fields discard context.
+/// Invalid trace fields discard context without changing the required namespace.
 #[derive(Default, Debug)]
 pub struct Metadata {
+    /// Required routing identity on protocol v3 requests.
+    pub namespace: Option<talon_core::NamespaceId>,
     pub context: Option<TraceContext>,
     pub read_id: Option<[u8; 16]>,
     pub detail: Option<u8>,
@@ -36,7 +38,7 @@ pub fn decode<'a>(
     if header.version == 1 {
         return Ok((Metadata::default(), payload));
     }
-    if !supports_v2(header.msg_type) || payload.len() < 2 {
+    if (header.version == 2 && !supports_v2(header.msg_type)) || payload.len() < 2 {
         return Err(FrameError::InvalidEnvelope);
     }
     let len = u16::from_be_bytes([payload[0], payload[1]]) as usize;
@@ -84,11 +86,31 @@ pub fn decode<'a>(
             },
             4 if value.len() == 1 && value[0] <= 1 => result.detail = Some(value[0]),
             4 => invalid = true,
+            5 if header.version == 3 => {
+                if result.namespace.is_some() {
+                    return Err(FrameError::InvalidEnvelope);
+                }
+                let name = std::str::from_utf8(value).map_err(|_| FrameError::InvalidEnvelope)?;
+                let namespace = talon_core::NamespaceId::named(name);
+                namespace
+                    .validate()
+                    .map_err(|_| FrameError::InvalidEnvelope)?;
+                result.namespace = Some(namespace);
+            }
             _ => {}
         }
     }
+    if header.version == 3 && result.namespace.is_none() {
+        return Err(FrameError::InvalidEnvelope);
+    }
     if invalid {
-        return Ok((Metadata::default(), business));
+        return Ok((
+            Metadata {
+                namespace: result.namespace,
+                ..Metadata::default()
+            },
+            business,
+        ));
     }
     result.context = parent.and_then(|p| TraceContext::from_w3c(p, state));
     if result.context.is_none() {
@@ -163,8 +185,10 @@ pub fn outbound(frame: &mut Vec<u8>, endpoint: &str) -> Result<(), FrameError> {
     if !supports_v2(header.msg_type) {
         return Ok(());
     }
-    if header.version == 2 {
-        let (_, business) = decode(&header, &frame[HEADER_LEN..])?;
+    let mut namespace = None;
+    if matches!(header.version, 2 | 3) {
+        let (metadata, business) = decode(&header, &frame[HEADER_LEN..])?;
+        namespace = metadata.namespace;
         let business_len = business.len();
         let offset = frame.len() - business_len;
         frame.copy_within(offset.., HEADER_LEN);
@@ -176,6 +200,11 @@ pub fn outbound(frame: &mut Vec<u8>, endpoint: &str) -> Result<(), FrameError> {
     if let Some(context) = talon_telemetry::current_carrier() {
         encode(frame, Some(&context), talon_telemetry::current_read_id())?;
     }
+    // A retry has its own RPC span. Refresh its carrier without dropping the
+    // required v3 namespace or changing the business payload.
+    if let Some(namespace) = namespace {
+        encode_namespace(frame, &namespace)?;
+    }
     Ok(())
 }
 
@@ -183,4 +212,98 @@ pub fn outbound(frame: &mut Vec<u8>, endpoint: &str) -> Result<(), FrameError> {
 pub fn response_version<T: AsMut<[u8]>>(mut frame: T, version: u8) -> T {
     frame.as_mut()[2] = version;
     frame
+}
+
+/// Attach a required namespace carrier. Older servers reject protocol v3 rather
+/// than silently ignoring routing metadata and writing into the default namespace.
+/// Raw PUT/admission bytes remain outside the framed header.
+pub fn encode_namespace(
+    frame: &mut Vec<u8>,
+    namespace: &talon_core::NamespaceId,
+) -> Result<(), FrameError> {
+    encode_namespace_context(
+        frame,
+        namespace
+            .context()
+            .map_err(|_| FrameError::InvalidEnvelope)?,
+    )
+}
+
+/// Encode a namespace that was validated at the request boundary, without copying its name.
+pub fn encode_namespace_context(
+    frame: &mut Vec<u8>,
+    namespace: talon_core::NamespaceContext<'_>,
+) -> Result<(), FrameError> {
+    let mut header = FrameHeader::decode(frame)?;
+    if frame.len() != HEADER_LEN + header.length as usize {
+        return Err(FrameError::InvalidEnvelope);
+    }
+    if header.version == 3 {
+        let (metadata, _) = decode(&header, &frame[HEADER_LEN..])?;
+        return if metadata.namespace.as_ref().map(|t| t.effective_name()) == Some(namespace.name())
+        {
+            Ok(())
+        } else {
+            Err(FrameError::InvalidEnvelope)
+        };
+    }
+    let old_metadata = if header.version == 2 {
+        decode(&header, &frame[HEADER_LEN..])?;
+        u16::from_be_bytes([frame[HEADER_LEN], frame[HEADER_LEN + 1]]) as usize
+    } else {
+        0
+    };
+    let name = namespace.name().as_bytes();
+    let new_metadata = old_metadata + 3 + name.len();
+    if new_metadata > MAX_METADATA_LEN {
+        return Err(FrameError::InvalidEnvelope);
+    }
+    let prefix = if header.version == 1 { 2 } else { 0 };
+    let added = prefix + 3 + name.len();
+    let insertion = HEADER_LEN
+        + if header.version == 2 {
+            2 + old_metadata
+        } else {
+            0
+        };
+    let old_len = frame.len();
+    frame.resize(old_len + added, 0);
+    frame.copy_within(insertion..old_len, insertion + added);
+    frame[HEADER_LEN..HEADER_LEN + 2].copy_from_slice(&(new_metadata as u16).to_be_bytes());
+    let insertion = HEADER_LEN + 2 + old_metadata;
+    frame[insertion] = 5;
+    frame[insertion + 1..insertion + 3].copy_from_slice(&(name.len() as u16).to_be_bytes());
+    frame[insertion + 3..insertion + 3 + name.len()].copy_from_slice(name);
+    header.length += added as u32;
+    header.version = 3;
+    frame[..HEADER_LEN].copy_from_slice(&header.encode());
+    Ok(())
+}
+
+/// Preserve trace propagation and scope every worker operation to its namespace.
+pub fn outbound_namespace(
+    frame: &mut Vec<u8>,
+    endpoint: &str,
+    namespace: &talon_core::NamespaceId,
+) -> Result<(), FrameError> {
+    outbound_namespace_context(
+        frame,
+        endpoint,
+        namespace
+            .context()
+            .map_err(|_| FrameError::InvalidEnvelope)?,
+    )
+}
+
+/// Propagate a borrowed request context without revalidating or owning its name.
+pub fn outbound_namespace_context(
+    frame: &mut Vec<u8>,
+    endpoint: &str,
+    namespace: talon_core::NamespaceContext<'_>,
+) -> Result<(), FrameError> {
+    outbound(frame, endpoint)?;
+    if namespace.name() != talon_core::DEFAULT_NAMESPACE {
+        encode_namespace_context(frame, namespace)?;
+    }
+    Ok(())
 }

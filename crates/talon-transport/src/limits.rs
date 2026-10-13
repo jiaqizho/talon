@@ -52,10 +52,10 @@ pub fn max_payload_for(msg_type: MsgType) -> u32 {
         | MsgType::Delete
         | MsgType::GetCachedRange
         | MsgType::AdmitCachedBlock
-        | MsgType::GetRangeTenant
-        | MsgType::GetCachedRangeTenant
+        | MsgType::GetRangeNamespace
+        | MsgType::GetCachedRangeNamespace
         | MsgType::GetVersionedRange
-        | MsgType::GetVersionedRangeTenant => MAX_CONTROL_PAYLOAD_LEN,
+        | MsgType::GetVersionedRangeNamespace => MAX_CONTROL_PAYLOAD_LEN,
         MsgType::Get | MsgType::GetRange => MAX_PAYLOAD_LEN,
     }
 }
@@ -111,7 +111,7 @@ where
     // Decode the header (validates magic/version/type and the global max), then
     // enforce the per-type cap BEFORE allocating the payload.
     let header = FrameHeader::decode(&header_buf)?;
-    let cap = max_payload_for(header.msg_type).saturating_add(if header.version == 2 {
+    let cap = max_payload_for(header.msg_type).saturating_add(if header.version >= 2 {
         crate::envelope::ENVELOPE_OVERHEAD
     } else {
         0

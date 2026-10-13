@@ -17,15 +17,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use talon_core::{BlockId, ObjectId, RequestId, TenantId, Version};
+use talon_core::{BlockId, NamespaceId, ObjectId, RequestId, Version};
 use talon_transport::frame::{FrameHeader, MsgType, HEADER_LEN};
 use talon_transport::{
-    decode_error_payload, encode_cached_block_put_header, encode_cached_request,
-    encode_cached_tenant_request, encode_delete, encode_put_header, encode_request,
-    encode_tenant_request, encode_versioned_request, encode_versioned_tenant_request,
-    CachedBlockPutRequest, CachedRangeRequest, DataPlaneError, DeleteRequest, Flags, PutRequest,
-    RangeRequest, TenantScopedCachedRange, TenantScopedRange, TenantScopedVersionedRange,
-    VersionedRangeRequest, MAX_CONTROL_PAYLOAD_LEN,
+    decode_error_payload, encode_cached_block_put_header, encode_cached_namespace_request,
+    encode_cached_request, encode_delete, encode_namespace_request, encode_put_header,
+    encode_request, encode_versioned_namespace_request, encode_versioned_request,
+    CachedBlockPutRequest, CachedRangeRequest, DataPlaneError, DeleteRequest, Flags,
+    NamespaceScopedCachedRange, NamespaceScopedRange, NamespaceScopedVersionedRange, PutRequest,
+    RangeRequest, VersionedRangeRequest, MAX_CONTROL_PAYLOAD_LEN,
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -169,9 +169,9 @@ pub enum WorkerLoadError {
 pub struct WorkerClient {
     addr: String,
     pool: Arc<ConnectionPool>,
-    /// Tenant every fetch from this client is attributed to. `Unattributed`
-    /// unless set with [`with_tenant`](Self::with_tenant).
-    tenant: TenantId,
+    /// Namespace every fetch from this client is attributed to. `Unattributed`
+    /// unless set with [`with_namespace`](Self::with_namespace).
+    namespace: NamespaceId,
 }
 
 impl WorkerClient {
@@ -189,7 +189,7 @@ impl WorkerClient {
         Self {
             addr: addr.into(),
             pool,
-            tenant: TenantId::Unattributed,
+            namespace: NamespaceId::Unattributed,
         }
     }
 
@@ -198,53 +198,53 @@ impl WorkerClient {
         &self.addr
     }
 
-    /// Attribute every fetch from this client to `tenant` for per-tenant QoS.
+    /// Attribute every fetch from this client to `namespace` for per-namespace QoS.
     ///
-    /// A named tenant is sent as a `GetRangeTenant` frame; the default
-    /// (`Unattributed`) sends an ordinary `GetRange`. Send a named tenant only
+    /// A named namespace is sent as a `GetRangeNamespace` frame; the default
+    /// (`Unattributed`) sends an ordinary `GetRange`. Send a named namespace only
     /// to workers known to understand the type — an older worker fails the
     /// request closed rather than misreading it.
-    pub fn with_tenant(mut self, tenant: TenantId) -> Self {
-        self.tenant = tenant;
+    pub fn with_namespace(mut self, namespace: NamespaceId) -> Self {
+        self.namespace = namespace;
         self
     }
 
-    /// Encode a range request, as a tenant-scoped frame when this client is
-    /// bound to a named tenant, else as a plain `GetRange`.
+    /// Encode a range request, as a namespace-scoped frame when this client is
+    /// bound to a named namespace, else as a plain `GetRange`.
     fn encode_range_request(
         &self,
         request_id: u32,
         request: RangeRequest,
     ) -> Result<Vec<u8>, talon_transport::DataError> {
-        if self.tenant.is_unattributed() {
+        if self.namespace.is_unattributed() {
             encode_request(request_id, &request)
         } else {
-            encode_tenant_request(
+            encode_namespace_request(
                 request_id,
-                &TenantScopedRange {
-                    tenant: self.tenant.clone(),
+                &NamespaceScopedRange {
+                    namespace: self.namespace.clone(),
                     request,
                 },
             )
         }
     }
 
-    /// Encode a cache-only range request, as a tenant-scoped frame when this
-    /// client is bound to a named tenant, else as a plain `GetCachedRange`. A
-    /// named tenant keeps resident-only reads attributed so they are metered by
+    /// Encode a cache-only range request, as a namespace-scoped frame when this
+    /// client is bound to a named namespace, else as a plain `GetCachedRange`. A
+    /// named namespace keeps resident-only reads attributed so they are metered by
     /// the worker like any other read.
     fn encode_cached_range_request(
         &self,
         request_id: u32,
         request: CachedRangeRequest,
     ) -> Result<Vec<u8>, talon_transport::DataError> {
-        if self.tenant.is_unattributed() {
+        if self.namespace.is_unattributed() {
             encode_cached_request(request_id, &request)
         } else {
-            encode_cached_tenant_request(
+            encode_cached_namespace_request(
                 request_id,
-                &TenantScopedCachedRange {
-                    tenant: self.tenant.clone(),
+                &NamespaceScopedCachedRange {
+                    namespace: self.namespace.clone(),
                     request,
                 },
             )
@@ -252,20 +252,20 @@ impl WorkerClient {
     }
 
     /// Encode an origin-backed range request pinned to one source version.
-    /// Named tenants use a distinct attributed message type; both variants fail
+    /// Named namespaces use a distinct attributed message type; both variants fail
     /// closed on workers that predate version-pinned reads.
     fn encode_versioned_range_request(
         &self,
         request_id: u32,
         request: VersionedRangeRequest,
     ) -> Result<Vec<u8>, talon_transport::DataError> {
-        if self.tenant.is_unattributed() {
+        if self.namespace.is_unattributed() {
             encode_versioned_request(request_id, &request)
         } else {
-            encode_versioned_tenant_request(
+            encode_versioned_namespace_request(
                 request_id,
-                &TenantScopedVersionedRange {
-                    tenant: self.tenant.clone(),
+                &NamespaceScopedVersionedRange {
+                    namespace: self.namespace.clone(),
                     request,
                 },
             )
@@ -1175,8 +1175,8 @@ mod tests {
     use std::time::Duration;
     use talon_core::Backend;
     use talon_transport::{
-        decode_cached_block_put_header, decode_cached_request, decode_cached_tenant_request,
-        decode_request, decode_tenant_request, decode_versioned_request, encode_error,
+        decode_cached_block_put_header, decode_cached_namespace_request, decode_cached_request,
+        decode_namespace_request, decode_request, decode_versioned_request, encode_error,
         response_header_ok,
     };
     use tokio::net::TcpListener;
@@ -1349,23 +1349,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tenant_client_sends_a_tenant_scoped_frame() {
+    async fn namespace_client_sends_a_namespace_scoped_frame() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
-        let seen: Arc<std::sync::Mutex<Option<TenantId>>> = Arc::new(std::sync::Mutex::new(None));
+        let seen: Arc<std::sync::Mutex<Option<NamespaceId>>> =
+            Arc::new(std::sync::Mutex::new(None));
         let recorded = Arc::clone(&seen);
         tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
             let mut hdr = [0u8; HEADER_LEN];
             sock.read_exact(&mut hdr).await.unwrap();
             let header = FrameHeader::decode(&hdr).unwrap();
-            assert_eq!(header.msg_type, MsgType::GetRangeTenant);
+            assert_eq!(header.msg_type, MsgType::GetRangeNamespace);
             let mut body = vec![0u8; header.length as usize];
             sock.read_exact(&mut body).await.unwrap();
             let mut full = hdr.to_vec();
             full.extend_from_slice(&body);
-            let (_h, scoped) = decode_tenant_request(&full).unwrap();
-            *recorded.lock().unwrap() = Some(scoped.tenant);
+            let (_h, scoped) = decode_namespace_request(&full).unwrap();
+            *recorded.lock().unwrap() = Some(scoped.namespace);
             // Reply with the requested bytes so the client fetch succeeds; the
             // reply is an ordinary GetRange frame.
             let mut out = response_header_ok(header.request_id, scoped.request.len as u32).to_vec();
@@ -1374,15 +1375,18 @@ mod tests {
             sock.flush().await.unwrap();
         });
 
-        let client = WorkerClient::new(addr).with_tenant(TenantId::named("acme"));
+        let client = WorkerClient::new(addr).with_namespace(NamespaceId::named("acme"));
         let bytes = client.fetch_range(&object(), 0, 16).await.unwrap();
         assert_eq!(bytes.len(), 16);
-        assert_eq!(seen.lock().unwrap().take(), Some(TenantId::named("acme")));
+        assert_eq!(
+            seen.lock().unwrap().take(),
+            Some(NamespaceId::named("acme"))
+        );
     }
 
     #[tokio::test]
     async fn default_client_sends_a_plain_getrange() {
-        // Without a tenant the client sends an ordinary GetRange, which the
+        // Without a namespace the client sends an ordinary GetRange, which the
         // GetRange-only mock worker decodes successfully (backward compatible).
         let addr = mock_worker(|req| {
             let mut out = response_header_ok(0, req.len as u32).to_vec();
@@ -1467,39 +1471,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tenant_client_sends_a_cached_tenant_scoped_frame() {
-        // A tenant-bound client attributes cache-only reads too, so a resident
-        // read cannot slip past per-tenant metering on the worker.
+    async fn namespace_client_sends_a_cached_namespace_scoped_frame() {
+        // A namespace-bound client attributes cache-only reads too, so a resident
+        // read cannot slip past per-namespace metering on the worker.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
-        let seen: Arc<std::sync::Mutex<Option<TenantId>>> = Arc::new(std::sync::Mutex::new(None));
+        let seen: Arc<std::sync::Mutex<Option<NamespaceId>>> =
+            Arc::new(std::sync::Mutex::new(None));
         let recorded = Arc::clone(&seen);
         tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
             let mut hdr = [0u8; HEADER_LEN];
             sock.read_exact(&mut hdr).await.unwrap();
             let header = FrameHeader::decode(&hdr).unwrap();
-            assert_eq!(header.msg_type, MsgType::GetCachedRangeTenant);
+            assert_eq!(header.msg_type, MsgType::GetCachedRangeNamespace);
             let mut body = vec![0u8; header.length as usize];
             sock.read_exact(&mut body).await.unwrap();
             let mut full = hdr.to_vec();
             full.extend_from_slice(&body);
-            let (_h, scoped) = decode_cached_tenant_request(&full).unwrap();
+            let (_h, scoped) = decode_cached_namespace_request(&full).unwrap();
             assert_eq!(scoped.request.version, Version::new("etag-v2"));
-            *recorded.lock().unwrap() = Some(scoped.tenant);
+            *recorded.lock().unwrap() = Some(scoped.namespace);
             let mut out = response_header_ok(header.request_id, scoped.request.len as u32).to_vec();
             out.resize(out.len() + scoped.request.len as usize, 0);
             sock.write_all(&out).await.unwrap();
             sock.flush().await.unwrap();
         });
 
-        let client = WorkerClient::new(addr).with_tenant(TenantId::named("acme"));
+        let client = WorkerClient::new(addr).with_namespace(NamespaceId::named("acme"));
         let bytes = client
             .fetch_cached_range(&object(), &Version::new("etag-v2"), 0, 16)
             .await
             .unwrap();
         assert_eq!(bytes.len(), 16);
-        assert_eq!(seen.lock().unwrap().take(), Some(TenantId::named("acme")));
+        assert_eq!(
+            seen.lock().unwrap().take(),
+            Some(NamespaceId::named("acme"))
+        );
     }
 
     #[tokio::test]

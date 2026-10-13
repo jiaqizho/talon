@@ -88,7 +88,7 @@ Lowercase DNS trust domain required in peer workload URI SANs.
 
 ### `namespace_policy_path`
 
-Mounted static namespace authorization policy (TOML).
+Mounted static object namespace authorization policy (TOML).
 
 - **Environment variable:** `TALON_COORDINATOR_NAMESPACE_POLICY_PATH`
 - **Default:** none
@@ -332,7 +332,7 @@ Lowercase DNS trust domain required in peer workload URI SANs.
 
 ### `namespace_policy_path`
 
-Mounted static namespace authorization policy (TOML).
+Mounted static object namespace authorization policy (TOML).
 
 - **Environment variable:** `TALON_WORKER_NAMESPACE_POLICY_PATH`
 - **Default:** none
