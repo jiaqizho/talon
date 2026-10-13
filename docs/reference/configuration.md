@@ -482,6 +482,22 @@ L2 page size in bytes; 0 keeps whole-block L2, non-zero enables paged L2.
 - **Default:** `0`
 - **CLI flag:** not settable via CLI (config file or environment only)
 
+### `ownership_gc_enabled`
+
+Reclaim misplaced cache blocks on membership changes and hourly admission checks.
+
+- **Environment variable:** `TALON_WORKER_OWNERSHIP_GC_ENABLED`
+- **Default:** `true`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `ownership_gc_replicas`
+
+Number of placement candidates to retain; must cover every reader replica count.
+
+- **Environment variable:** `TALON_WORKER_OWNERSHIP_GC_REPLICAS`
+- **Default:** `1`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
 ### `page_tti_hours`
 
 Page time to idle in hours; 0 disables idle expiration.

@@ -313,21 +313,36 @@ impl WorkerRuntime {
     /// Retire an entire stale block in one owned mutation. Page count affects
     /// disk pacing, never which subset of the block is selected for eviction.
     pub(super) async fn unlink_stale_block(&self, candidate: crate::eviction::StaleBlockCandidate) {
+        self.unlink_stale_block_for(candidate, None).await;
+    }
+
+    /// Ownership supplies the observed placement after paying deletion credits.
+    pub(super) async fn unlink_stale_block_for(
+        &self,
+        candidate: crate::eviction::StaleBlockCandidate,
+        membership: Option<Arc<super::MembershipSnapshot>>,
+    ) {
         let runtime = self.clone();
         self.page_mutations.run(async move {
-            let _permit = runtime.page_gc_io.clone().acquire_owned().await
-                .expect("page GC semaphore closed");
-            if let Some(budget) = &runtime.background_budget {
-                budget.delete_units(candidate.units as u64).await;
+            let ownership_deadline = membership.as_ref().map(|view| view.valid_until);
+            let reason = if ownership_deadline.is_some() { 4 } else { 3 };
+            let Some(permit) = before_deadline(ownership_deadline, runtime.page_gc_io.clone().acquire_owned()).await else { return; };
+            let _permit = permit.expect("page GC semaphore closed");
+            if ownership_deadline.is_none() {
+                if let Some(budget) = &runtime.background_budget {
+                    budget.delete_units(candidate.units as u64).await;
+                }
             }
-            let _background_io = runtime.background_io().await;
+            let Some(_background_io) = before_deadline(ownership_deadline, runtime.background_io()).await else { return; };
             let state = runtime.page_lifecycle.block(&candidate.block);
             {
-                let _gate = state.gate.lock().await;
+                let Some(_gate) = before_deadline(ownership_deadline, state.gate.lock()).await else { return; };
                 if !runtime.lru.stale_candidate_is_current(&candidate) { return; }
                 let Some(claim) = state.claim_all_pages() else { return; };
                 // A reader may have completed while the pages were being closed.
                 if !runtime.lru.stale_candidate_is_current(&candidate) { return; }
+                if membership.as_ref().is_some_and(|view|
+                    Instant::now() >= view.valid_until || !runtime.membership_is_current(view)) { return; }
                 let id = &candidate.block;
                 let bytes = runtime.index.get(id).map_or(0, |meta| meta.resident_bytes());
                 let pages = claim.len();
@@ -349,8 +364,8 @@ impl WorkerRuntime {
                 claim.finish(runtime.page_clock.now());
                 runtime.metrics.record_eviction();
                 if pages > 0 {
-                    runtime.page_gc_metrics.deleted[3].add(pages as u64);
-                    runtime.page_gc_metrics.bytes[3].add(bytes);
+                    runtime.page_gc_metrics.deleted[reason].add(pages as u64);
+                    runtime.page_gc_metrics.bytes[reason].add(bytes);
                 }
             }
             runtime.page_lifecycle.retire_empty(&candidate.block);
@@ -608,5 +623,17 @@ impl WorkerRuntime {
         }
         self.page_gc_metrics.dirty_blocks.set(remaining as f64);
         self.page_gc_metrics.dirty_age.set(oldest as f64 / 1000.0);
+    }
+}
+
+async fn before_deadline<F: std::future::Future>(
+    deadline: Option<Instant>,
+    work: F,
+) -> Option<F::Output> {
+    match deadline {
+        Some(at) => tokio::time::timeout_at(tokio::time::Instant::from_std(at), work)
+            .await
+            .ok(),
+        None => Some(work.await),
     }
 }

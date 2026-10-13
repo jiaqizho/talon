@@ -170,6 +170,10 @@ pub struct WorkerConfig {
     /// once. This bounds a fragmented block's fan-out to the backend and local
     /// cache while still overlapping unrelated misses.
     pub paged_miss_run_concurrency: usize,
+    /// Reclaim misplaced cache blocks on membership changes and hourly admission checks.
+    pub ownership_gc_enabled: bool,
+    /// Number of placement candidates to retain; must cover every reader replica count.
+    pub ownership_gc_replicas: usize,
     /// Worker-wide LOAD payload bytes reserved through cache commit (default 1 GiB).
     pub load_inflight_bytes: u64,
     /// Page time to idle in hours; 0 disables idle expiration.
@@ -335,6 +339,8 @@ impl Default for WorkerConfig {
             l1_page_size_bytes: 256 << 10,
             l2_page_size_bytes: 0,
             paged_miss_run_concurrency: 8,
+            ownership_gc_enabled: true,
+            ownership_gc_replicas: 1,
             load_inflight_bytes: 1 << 30,
             page_tti_hours: 0,
             page_access_checkpoint_interval_minutes: 1,
@@ -429,6 +435,10 @@ pub struct WorkerConfigPatch {
     pub l2_page_size_bytes: Option<u64>,
     /// Override for [`WorkerConfig::paged_miss_run_concurrency`].
     pub paged_miss_run_concurrency: Option<usize>,
+    /// Override for [`WorkerConfig::ownership_gc_enabled`].
+    pub ownership_gc_enabled: Option<bool>,
+    /// Override for [`WorkerConfig::ownership_gc_replicas`].
+    pub ownership_gc_replicas: Option<usize>,
     /// Override for [`WorkerConfig::load_inflight_bytes`].
     pub load_inflight_bytes: Option<u64>,
     /// Override for [`WorkerConfig::page_tti_hours`].
@@ -536,6 +546,8 @@ impl Patch for WorkerConfigPatch {
             paged_miss_run_concurrency: self
                 .paged_miss_run_concurrency
                 .or(base.paged_miss_run_concurrency),
+            ownership_gc_enabled: self.ownership_gc_enabled.or(base.ownership_gc_enabled),
+            ownership_gc_replicas: self.ownership_gc_replicas.or(base.ownership_gc_replicas),
             load_inflight_bytes: self.load_inflight_bytes.or(base.load_inflight_bytes),
             page_tti_hours: self.page_tti_hours.or(base.page_tti_hours),
             page_access_checkpoint_interval_minutes: self
@@ -754,6 +766,8 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
         secret: false,
         help: "L2 page size in bytes; 0 keeps whole-block L2, non-zero enables paged L2.",
     },
+    ConfigVar { env: "TALON_WORKER_OWNERSHIP_GC_ENABLED", key: "ownership_gc_enabled", default: Some("true"), cli: false, secret: false, help: "Reclaim misplaced cache blocks on membership changes and hourly admission checks." },
+    ConfigVar { env: "TALON_WORKER_OWNERSHIP_GC_REPLICAS", key: "ownership_gc_replicas", default: Some("1"), cli: false, secret: false, help: "Number of placement candidates to retain; must cover every reader replica count." },
     ConfigVar { env: "TALON_WORKER_PAGE_TTI_HOURS", key: "page_tti_hours", default: Some("0"), cli: false, secret: false, help: "Page time to idle in hours; 0 disables idle expiration." },
     ConfigVar { env: "TALON_WORKER_PAGE_ACCESS_CHECKPOINT_INTERVAL_MINUTES", key: "page_access_checkpoint_interval_minutes", default: Some("1"), cli: false, secret: false, help: "Dirty page access checkpoint interval in minutes." },
     ConfigVar { env: "TALON_WORKER_PAGE_GC_INTERVAL_MINUTES", key: "page_gc_interval_minutes", default: Some("10"), cli: false, secret: false, help: "Delay between complete page GC passes in minutes." },
@@ -989,6 +1003,8 @@ pub(crate) mod worker_env {
     pub const L2_PAGE_SIZE_BYTES: &str = "TALON_WORKER_L2_PAGE_SIZE_BYTES";
     pub const LOAD_INFLIGHT_BYTES: &str = "TALON_WORKER_LOAD_INFLIGHT_BYTES";
     pub const PAGED_MISS_RUN_CONCURRENCY: &str = "TALON_WORKER_PAGED_MISS_RUN_CONCURRENCY";
+    pub const OWNERSHIP_GC_ENABLED: &str = "TALON_WORKER_OWNERSHIP_GC_ENABLED";
+    pub const OWNERSHIP_GC_REPLICAS: &str = "TALON_WORKER_OWNERSHIP_GC_REPLICAS";
     pub const PAGE_TTI_HOURS: &str = "TALON_WORKER_PAGE_TTI_HOURS";
     pub const PAGE_ACCESS_CHECKPOINT_INTERVAL_MINUTES: &str =
         "TALON_WORKER_PAGE_ACCESS_CHECKPOINT_INTERVAL_MINUTES";
@@ -1145,6 +1161,12 @@ impl WorkerConfigPatch {
             paged_miss_run_concurrency: get(worker_env::PAGED_MISS_RUN_CONCURRENCY)
                 .map(|v| parse_usize(v, worker_env::PAGED_MISS_RUN_CONCURRENCY))
                 .transpose()?,
+            ownership_gc_enabled: get(worker_env::OWNERSHIP_GC_ENABLED)
+                .map(|v| parse_bool(v, worker_env::OWNERSHIP_GC_ENABLED))
+                .transpose()?,
+            ownership_gc_replicas: get(worker_env::OWNERSHIP_GC_REPLICAS)
+                .map(|v| parse_usize(v, worker_env::OWNERSHIP_GC_REPLICAS))
+                .transpose()?,
             load_inflight_bytes: get(worker_env::LOAD_INFLIGHT_BYTES)
                 .map(|v| parse_u64(v, worker_env::LOAD_INFLIGHT_BYTES))
                 .transpose()?,
@@ -1297,6 +1319,12 @@ impl WorkerConfig {
             paged_miss_run_concurrency: merged
                 .paged_miss_run_concurrency
                 .unwrap_or(d.paged_miss_run_concurrency),
+            ownership_gc_enabled: merged
+                .ownership_gc_enabled
+                .unwrap_or(d.ownership_gc_enabled),
+            ownership_gc_replicas: merged
+                .ownership_gc_replicas
+                .unwrap_or(d.ownership_gc_replicas),
             load_inflight_bytes: merged.load_inflight_bytes.unwrap_or(d.load_inflight_bytes),
             page_tti_hours: merged.page_tti_hours.unwrap_or(d.page_tti_hours),
             page_access_checkpoint_interval_minutes: merged
@@ -1444,6 +1472,11 @@ impl WorkerConfig {
         }
         if self.block_size == 0 {
             return Err(Error::Other("block_size must be > 0".into()));
+        }
+        if self.ownership_gc_replicas == 0 {
+            return Err(Error::Other(
+                "ownership GC replica count must be positive".into(),
+            ));
         }
         for (name, value) in [
             (
@@ -1919,6 +1952,48 @@ impl FuseConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ownership_gc_configuration_precedence_and_validation() {
+        let file = WorkerConfigPatch::from_toml(
+            "ownership_gc_enabled = false\nownership_gc_replicas = 2\n",
+        )
+        .unwrap();
+        let env = WorkerConfigPatch::from_env_with(|name| match name {
+            "TALON_WORKER_OWNERSHIP_GC_ENABLED" => Some("true".into()),
+            "TALON_WORKER_OWNERSHIP_GC_REPLICAS" => Some("3".into()),
+            _ => None,
+        })
+        .unwrap();
+        let cfg = WorkerConfig::resolve(file, env, Default::default()).unwrap();
+        assert!(cfg.ownership_gc_enabled);
+        assert_eq!(cfg.ownership_gc_replicas, 3);
+        assert!(WorkerConfig::default().ownership_gc_enabled);
+        assert!(
+            WorkerConfig::resolve(Default::default(), Default::default(), Default::default())
+                .unwrap()
+                .ownership_gc_enabled
+        );
+        let disabled = WorkerConfigPatch::from_toml("ownership_gc_enabled = false").unwrap();
+        assert!(
+            !WorkerConfig::resolve(disabled, Default::default(), Default::default())
+                .unwrap()
+                .ownership_gc_enabled
+        );
+        let env_disabled = WorkerConfigPatch::from_env_with(|name| match name {
+            "TALON_WORKER_OWNERSHIP_GC_ENABLED" => Some("false".into()),
+            _ => None,
+        })
+        .unwrap();
+        let enabled = WorkerConfigPatch::from_toml("ownership_gc_enabled = true").unwrap();
+        assert!(
+            !WorkerConfig::resolve(enabled, env_disabled, Default::default())
+                .unwrap()
+                .ownership_gc_enabled
+        );
+        let patch = WorkerConfigPatch::from_toml("ownership_gc_replicas = 0").unwrap();
+        assert!(WorkerConfig::resolve(patch, Default::default(), Default::default()).is_err());
+    }
 
     #[test]
     fn env_schemas_are_wellformed() {

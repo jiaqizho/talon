@@ -109,7 +109,7 @@ pub(crate) struct EvictionCandidate {
 pub(crate) struct StaleBlockCandidate {
     pub block: BlockId,
     pub units: usize,
-    revision: u64,
+    pub revision: u64,
     last_access: u64,
 }
 
@@ -159,6 +159,8 @@ struct Inner {
     object_checks: HashMap<ObjectId, (usize, Option<u64>)>,
     total_bytes: u64,
     clock: u64,
+    // Unlike clock, this does not advance for capacity-policy rotations or reads.
+    admission_ceiling: u64,
 }
 
 impl Inner {
@@ -257,6 +259,7 @@ impl Lru {
                 object_checks: HashMap::new(),
                 total_bytes: 0,
                 clock: 0,
+                admission_ceiling: 0,
             }),
             eviction: Mutex::new(()),
         }
@@ -283,6 +286,7 @@ impl Lru {
         let mut g = self.inner.lock().unwrap();
         let position = g.clock;
         g.clock = g.clock.checked_add(1).expect("eviction sequence exhausted");
+        g.admission_ceiling = g.clock;
         if let Some(e) = g.entries.get_mut(&unit) {
             let old = e.bytes;
             e.bytes = bytes;
@@ -560,6 +564,33 @@ impl Lru {
             }
         }
         out
+    }
+
+    /// Advance one block in a fixed admission prefix, without backend policy or
+    /// a candidate buffer. The caller checks revision and placement after unlocking.
+    pub(crate) fn next_ownership_block(
+        &self,
+        cursor: &mut (u64, u64),
+    ) -> Option<StaleBlockCandidate> {
+        let g = self.inner.lock().unwrap();
+        let (&position, block) = g.block_queue.range(cursor.0..cursor.1).next()?;
+        cursor.0 = position + 1;
+        let activity = &g.block_access[block];
+        Some(StaleBlockCandidate {
+            block: block.clone(),
+            units: activity.units,
+            revision: activity.revision,
+            last_access: activity.access.load(Ordering::Relaxed),
+        })
+    }
+
+    pub(crate) fn block_scan_ceiling(&self) -> u64 {
+        self.inner.lock().unwrap().clock
+    }
+
+    /// Constant-time check for cache admissions since an ownership sweep.
+    pub(crate) fn ownership_admission_ceiling(&self) -> u64 {
+        self.inner.lock().unwrap().admission_ceiling
     }
 
     pub(crate) fn stale_candidate_is_current(&self, candidate: &StaleBlockCandidate) -> bool {
