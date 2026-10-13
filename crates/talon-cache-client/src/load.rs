@@ -126,6 +126,24 @@ fn validate_file(file: &FileView<'_>) -> Result<LoadResult, LoadError> {
 }
 
 impl BlockReader {
+    /// Resolve only the background snapshot; LOAD never initiates discovery I/O.
+    async fn with_load_owner<T, F, Fut>(
+        &self,
+        block: &talon_core::BlockId,
+        topology: &std::sync::Arc<talon_core::CachePlacementTable>,
+        send: F,
+    ) -> Result<T, LoadError>
+    where
+        F: FnOnce(crate::WorkerClient) -> Fut,
+        Fut: std::future::Future<Output = Result<T, LoadError>>,
+    {
+        let current = self.membership_snapshot().await?;
+        if !std::sync::Arc::ptr_eq(&current.placement, topology) {
+            return Err(LoadError::MembershipChanged);
+        }
+        send(current.owner(block)?).await
+    }
+
     /// Warm a file directly on its primary workers using the read placement.
     ///
     /// The caller supplies version and size, so no HEAD is issued. Membership
@@ -160,19 +178,18 @@ impl BlockReader {
                         .acquire()
                         .await
                         .expect("load semaphore is never closed");
-                    let current = self.membership_snapshot().await?;
-                    if !std::sync::Arc::ptr_eq(&current.placement, topology) {
-                        return Err(LoadError::MembershipChanged);
-                    }
-                    let client = current.owner(&segment.block)?;
-                    client
-                        .load_block(&segment.block, u64::from(segment.len))
-                        .await
-                        .map_err(|source| LoadError::Worker {
-                            worker: client.addr().into(),
-                            offset: segment.block.offset,
-                            source,
-                        })
+                    let block = &segment.block;
+                    self.with_load_owner(block, topology, |client| async move {
+                        client
+                            .load_block(block, u64::from(segment.len))
+                            .await
+                            .map_err(|source| LoadError::Worker {
+                                worker: client.addr().into(),
+                                offset: block.offset,
+                                source,
+                            })
+                    })
+                    .await
                 }
             })
             .buffer_unordered(8)
@@ -199,7 +216,7 @@ impl BlockReader {
     /// limit (including tracing overhead), with indexed failures in the reply.
     /// Results follow input order, including empty files and duplicates. One
     /// logical topology and 30-minute deadline cover the entire call. Instance
-    /// discovery is refreshed before dispatch when its validity has expired.
+    /// discovery is maintained by the background thread, independently of dispatch.
     /// Single and batch loads share eight active RPCs. Individual failures do not
     /// cancel other files. Errors report failed/unconfirmed file indices. This is not atomic.
     pub async fn batch_load(
@@ -313,19 +330,22 @@ impl BlockReader {
                                     .acquire()
                                     .await
                                     .expect("load semaphore is never closed");
-                                let current = self.membership_snapshot().await?;
-                                if !std::sync::Arc::ptr_eq(&current.placement, topology) {
-                                    return Err(LoadError::MembershipChanged);
-                                }
-                                let client = current.owner(&blocks[0].block)?;
-                                client
-                                    .batch_load(&blocks)
-                                    .await
-                                    .map(|failures| (client.addr().to_owned(), failures))
-                                    .map_err(|source| LoadError::WorkerBatch {
-                                        worker: client.addr().into(),
-                                        source,
-                                    })
+                                let blocks = &blocks;
+                                self.with_load_owner(
+                                    &blocks[0].block,
+                                    topology,
+                                    |client| async move {
+                                        client
+                                            .batch_load(blocks)
+                                            .await
+                                            .map(|failures| (client.addr().to_owned(), failures))
+                                            .map_err(|source| LoadError::WorkerBatch {
+                                                worker: client.addr().into(),
+                                                source,
+                                            })
+                                    },
+                                )
+                                .await
                             }
                             .await;
                             (indices, result)
@@ -529,7 +549,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_does_not_route_to_offline_conflicting_or_expired_instances() {
+    async fn load_does_not_route_to_offline_or_conflicting_instances() {
         use talon_core::worker_membership::InstanceState;
         let a = worker("a", Duration::ZERO, true).await;
         let reader = reader("127.0.0.1:0".into(), std::slice::from_ref(&a.node));
@@ -575,18 +595,6 @@ mod tests {
                 );
             }
         }
-        let expired = WorkerClient::new(a.node.address.clone())
-            .with_read_retry_deadline(std::time::Instant::now());
-        let request = LoadBlockRequest {
-            block: BlockId::new(object(), 0, 8, Version::new("v1")),
-            len: 8,
-        };
-        assert!(
-            matches!(expired.load_block(&request.block, request.len).await, Err(WorkerLoadError::Instance(crate::WorkerError::Remote(error))) if error.code == talon_transport::DataErrorCode::Unavailable)
-        );
-        assert!(
-            matches!(expired.batch_load(&[request]).await, Err(WorkerLoadError::Instance(crate::WorkerError::Remote(error))) if error.code == talon_transport::DataErrorCode::Unavailable)
-        );
         assert!(a.requests.lock().unwrap().is_empty());
     }
 
@@ -970,7 +978,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_directly_routes_all_blocks_without_contacting_cached_discovery() {
+    async fn load_routes_blocks_while_background_discovery_is_stalled() {
         let discovery = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let a = worker("a", Duration::ZERO, true).await;
         let b = worker("b", Duration::ZERO, true).await;
@@ -979,6 +987,8 @@ mod tests {
             discovery.local_addr().unwrap().to_string(),
             &[a.node.clone(), b.node.clone(), c.node.clone()],
         );
+        // Hold the independently started discovery RPC without responding.
+        let (_discovery_socket, _) = discovery.accept().await.unwrap();
         let result = reader
             .load(
                 &FileView {
@@ -1002,7 +1012,7 @@ mod tests {
             tokio::time::timeout(Duration::from_millis(10), discovery.accept())
                 .await
                 .is_err(),
-            "LOAD must not contact coordinator with fresh membership"
+            "LOAD must not start another discovery request"
         );
         let placement = reader.membership.last_good().unwrap().placement;
         let mut offsets = Vec::new();
@@ -1057,12 +1067,9 @@ mod tests {
             std::slice::from_ref(&a.node),
             std::time::Instant::now() - Duration::from_secs(1),
         );
-        assert!(
-            reader.load(&file, 103).await.is_err(),
-            "expired discovery must not dial a stale instance during outage"
-        );
-        assert!(reader.batch_load(&[file], 104).await.is_err());
-        assert_eq!(a.requests.lock().unwrap().len(), 9);
+        reader.load(&file, 103).await.unwrap();
+        reader.batch_load(&[file], 104).await.unwrap();
+        assert_eq!(a.requests.lock().unwrap().len(), 15);
     }
 
     #[tokio::test]
