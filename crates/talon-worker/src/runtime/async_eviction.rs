@@ -2,7 +2,6 @@
 use super::WorkerRuntime;
 #[cfg(test)]
 use std::sync::Arc;
-#[cfg(test)]
 use std::time::Duration;
 use talon_core::WorkerConfig;
 
@@ -10,6 +9,7 @@ pub(super) struct EvictionCycle {
     high: u64,
     low: u64,
     active: bool,
+    progressed: bool,
 }
 
 impl EvictionCycle {
@@ -18,10 +18,25 @@ impl EvictionCycle {
             high: ((capacity as f64 * config.async_eviction_high_watermark).ceil() as u64).max(1),
             low: (capacity as f64 * config.async_eviction_low_watermark).floor() as u64,
             active: false,
+            progressed: false,
         }
     }
 
+    pub(super) fn next_delay(&self, idle: Duration) -> Option<Duration> {
+        // A short retry also bounds spinning when readers/pins prevent progress.
+        Some(if self.active {
+            if self.progressed {
+                Duration::ZERO
+            } else {
+                Duration::from_secs(1)
+            }
+        } else {
+            idle
+        })
+    }
+
     pub(super) async fn tick(&mut self, worker: &WorkerRuntime) {
+        self.progressed = false;
         if let Some(registry) = worker.registry() {
             let workers = registry.snapshot();
             let total: u64 = workers.iter().map(|w| w.lru.total_bytes()).sum();
@@ -50,7 +65,9 @@ impl EvictionCycle {
                     .expect("eviction scan panicked");
                     namespace.unlink_units_to_target(units, 1, target).await;
                 }
-                self.active = workers.iter().map(|w| w.lru.total_bytes()).sum::<u64>() > self.low;
+                let remaining = workers.iter().map(|w| w.lru.total_bytes()).sum::<u64>();
+                self.progressed = remaining < total;
+                self.active = remaining > self.low;
             }
             return;
         }
@@ -73,7 +90,9 @@ impl EvictionCycle {
             .await
             .expect("eviction scan panicked");
             worker.unlink_units_to_target(units, 1, target).await;
-            self.active = worker.lru.total_bytes() > self.low;
+            let remaining = worker.lru.total_bytes();
+            self.progressed = remaining < bytes;
+            self.active = remaining > self.low;
         }
     }
 }
@@ -233,6 +252,15 @@ mod tests {
                 "pins prevent reaching the global low watermark of 112"
             );
             assert_eq!(namespaces[8].resident_bytes(), 0);
+            assert_eq!(
+                cycle.next_delay(Duration::from_secs(60)),
+                Some(Duration::ZERO)
+            );
+            cycle.tick(&worker).await;
+            assert_eq!(
+                cycle.next_delay(Duration::from_secs(60)),
+                Some(Duration::from_secs(1))
+            );
             drop(pins);
             cycle.tick(&worker).await;
             assert_eq!(
@@ -453,6 +481,33 @@ mod tests {
         cycle.tick(&r).await;
         assert_eq!(r.resident_bytes(), 0);
         assert!(!cycle.active);
+    }
+
+    #[tokio::test]
+    async fn backlog_continues_without_waiting_for_idle_interval() {
+        let root = tempfile::tempdir().unwrap();
+        let r = Arc::new(runtime(root.path(), false, 160));
+        for n in 0..9 {
+            fill(&r, n, false).await;
+        }
+        let config = WorkerConfig {
+            async_eviction_enabled: true,
+            async_eviction_low_watermark: 0.2,
+            background_delete_batch_size: 1,
+            background_task_concurrency: 1,
+            ownership_gc_enabled: false,
+            stale_gc_enabled: false,
+            ..Default::default()
+        };
+        let service = crate::runtime::WorkerBackground::start(r.clone(), &config);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while r.resident_bytes() > 32 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("backlog must not sleep a minute between deletions");
+        service.shutdown().await;
     }
 
     #[tokio::test]
