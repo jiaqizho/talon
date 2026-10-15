@@ -13,6 +13,7 @@
 
 pub mod azure;
 pub mod azure_sharedkey;
+pub mod broker;
 pub mod credentials;
 pub mod delay;
 pub mod endpoint;
@@ -28,9 +29,10 @@ pub mod xml;
 pub mod zone;
 
 pub use azure::{AzureBackend, AzureConfig};
+pub use broker::resolve_azure_broker_sas;
 pub use credentials::{
     CredentialsFetch, CredentialsObserver, NoopObserver, ProvideBearerToken, ProvideS3Credentials,
-    RefreshPolicy, RefreshingCredentials, StaticBearerToken, StaticS3Credentials,
+    ProvideSasToken, RefreshPolicy, RefreshingCredentials, StaticBearerToken, StaticS3Credentials,
 };
 pub use delay::{DelayConfig, DelayingHttpClient};
 pub use endpoint::endpoint_host;
